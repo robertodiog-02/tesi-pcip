@@ -1,0 +1,45 @@
+# Replica del SingleRNN di PedestrianActionBenchmark (box + speed su PIE)
+# Modello: Concatenate -> GRU(256) -> Dense(1), preprocessing benchmark.
+experiment:
+  name: benchmark_singlernn_weightsdifferent_onlydisplacement
+  seed: 42
+
+data:
+  annotation_root: /Users/robertodioguardi/Desktop/PIE
+  obs_len: 16
+  bbox_normalization: image_based #raw or image_based
+  speed_normalization: divide # raw or divide
+  drop_first_frame: True
+  sample_type: all
+
+model:
+  name: BenchmarkSingleRNN
+  hidden_dim: 256
+  num_layers: 1
+  dropout: 0.0
+  use_bbox: false
+  use_bbox_displacement: true
+  use_bbox_delta: false
+  use_ego_speed: false
+
+training:
+  epochs: 60
+  batch_size: 16
+
+  use_validation: false      # <-- niente val set: addestra tot epoche sul solo train
+                             #     (salva il modello finale come best_model.pt)
+
+  # Class weights della loss scelti da te: [w_neg, w_pos].
+  # Con BCE viene usato pos_weight = w_pos / w_neg.
+  # Il benchmark usava neg=0.25, pos=0.75  ->  pos_weight = 3.0
+  class_weights: [1.0, 3.0]
+
+
+  optimizer: adam            # il benchmark SingleRNN usa Adam (vedi warning nel log)
+  lr: 5.0e-5                 # come GRU_box_speed.yaml del benchmark
+  weight_decay: 0.0001
+
+  scheduler: none            # nessuno scheduler
+
+output:
+  checkpoint_dir: checkpoints

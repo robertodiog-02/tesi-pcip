@@ -1,0 +1,41 @@
+# Dataset PIE (non committare mai i dati)
+data/PIE/
+data/JAAD/
+*.mp4
+*.avi
+*.mov
+
+# Checkpoints e output
+checkpoints/
+runs/
+outputs/
+logs/
+*.pt
+*.pth
+*.ckpt
+
+# Pose cache
+cache/
+*.h5
+*.hdf5
+*.npz
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.env
+.venv
+venv/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+.idea/
+.vscode/

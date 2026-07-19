@@ -1,0 +1,68 @@
+experiment:
+  name: transformer_intent_model_last_token_layernormfirst_inputlayernorm
+  seed: 42
+
+data:
+  annotation_root: /Users/robertodioguardi/Desktop/PIE
+  obs_len: 16
+  bbox_normalization: image_based  # 'raw' or 'image_based'
+  speed_normalization: raw      # 'raw' or 'divide'
+  drop_first_frame: False          # Keep full 16 frames
+  sample_type: all
+
+model:
+  name: TransformerModalityNet
+  hidden_dim: 64                  # d_model (dimensione embedding per frame)
+  num_layers: 4                    # numero di layer Transformer Encoder
+  nhead: 4                         # numero di attention heads (hidden_dim deve essere divisibile per nhead)
+  dropout: 0.1
+  # Pooling — come si collassa la dimensione temporale prima della testa:
+  #   cls     : token CLS appreso (stile BERT/ViT)
+  #   last    : ultimo token = frame piu' vicino all'evento
+  #   mean    : global average pooling su tutti i token
+  #   flatten : concatena tutti i T token -> FC   (GTransPDM eq. 9)
+  pooling: last
+
+  # Fusione delle modalita':
+  #   false : fusione piatta — bbox, displacement, delta E speed proiettati,
+  #           concatenati e riproiettati tutti insieme (comportamento attuale)
+  #   true  : fusione gerarchica stile GTransPDM —
+  #             X_pe = FC(Concat[FC(bbox), FC(disp), FC(delta)])   (eq. 3)
+  #             X_ev = FC(FC(speed))                               (eq. 5)
+  #             x    = FC(Concat[X_pe, X_ev])                      (eq. 8)
+  #           la cinematica del pedone e il moto dell'ego restano separati
+  separate_encoder_speed_kinematics: false
+
+  # Pre-LN: LayerNorm PRIMA di attention/FFN dentro ogni layer del Transformer,
+  # invece che dopo (Post-LN, default PyTorch). Generalmente piu' stabile su
+  # dataset piccoli e reti addestrate da zero.
+  norm_first: true
+
+  # LayerNorm applicata alla sequenza subito prima del Transformer (dopo il
+  # positional encoding). Utile quando le feature hanno scale molto diverse
+  # tra loro (bbox in [0,1], displacement in pixel, speed in km/h).
+  use_input_layernorm: false
+
+  use_bbox: true
+  use_bbox_displacement: true
+  use_bbox_delta: false
+  use_ego_speed: true
+
+training:
+  epochs: 40
+  batch_size: 16
+  lr: 5.0e-5
+  weight_decay: 0.0001
+  patience: 60
+  scheduler: none
+  use_validation: false            # Allineato a benchmark_singlernn per addestrare sul dataset completo
+
+  # Class weights della loss: [w_neg, w_pos].
+  # Con BCE viene usato come pos_weight = w_pos / w_neg.
+  class_weights:
+    - 1.0
+    - 3.0
+
+output:
+  checkpoint_dir: checkpoints
+  log_dir: logs

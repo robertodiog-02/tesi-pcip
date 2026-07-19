@@ -1,0 +1,490 @@
+"""
+Training + Evaluation — Baseline GRU geometry-only (bbox + delta)
+=================================================================
+File unico: training, validation ed evaluation finale.
+
+Uso:
+    python train.py --config configs/baseline_base.yaml
+
+Per ogni epoca calcola su TRAIN e VAL:
+    loss, accuracy, f1, auc, precision, recall
+
+Al termine valuta il best model su train/val/test e salva:
+    - history.json   : tutte le metriche per epoca (train + val)
+    - test_results.json
+    - predictions.json : label/pred/prob per train, val, test (per le
+                         confusion matrix e i plot)
+Poi basta lanciare:
+    python plot_metrics.py --exp_dir checkpoints/<nome_esperimento>
+"""
+
+import os
+import json
+import time
+import random
+import argparse
+from pathlib import Path
+from typing import Dict, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import yaml
+from tqdm import tqdm
+
+from sklearn.metrics import (
+    accuracy_score, f1_score, roc_auc_score,
+    recall_score, precision_score,
+)
+
+from data.pie_dataset import PIEDataset
+from models.models import BaselineGRU, TransformerModalityNet
+from models.models_benchmark import BenchmarkSingleRNN
+from plot_metrics import plot_metric_curves, plot_confusion_matrices
+
+
+# ─── Utility ──────────────────────────────────────────────────────────────────
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def get_device() -> torch.device:
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("Device: Apple MPS")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"Device: CUDA — {torch.cuda.get_device_name(0)}")
+    else:
+        device = torch.device("cpu")
+        print("Device: CPU")
+    return device
+
+
+def load_config(config_path: str) -> Dict:
+    with open(config_path) as f:
+        return yaml.safe_load(f)
+
+
+def collate_fn(batch):
+    """Collate: bbox, bbox_displacement, bbox_delta, ego_speed, label (+ ped_id meta)."""
+    keys_tensor = ["bbox", "bbox_displacement", "bbox_delta", "ego_speed", "label"]
+    out = {k: torch.stack([b[k] for b in batch]) for k in keys_tensor}
+    out["ped_id"] = [b["ped_id"] for b in batch]
+    return out
+
+
+def build_model(cfg: Dict) -> nn.Module:
+    name = cfg["model"]["name"]
+    if name == "BaselineGRU":
+        return BaselineGRU(
+            hidden_dim=cfg["model"]["hidden_dim"],
+            num_layers=cfg["model"]["num_layers"],
+            dropout=cfg["model"]["dropout"],
+            use_bbox=cfg["model"].get("use_bbox", True),
+            use_bbox_displacement=cfg["model"].get("use_bbox_displacement", False),
+            use_bbox_delta=cfg["model"].get("use_bbox_delta", True),
+            use_ego_speed=cfg["model"].get("use_ego_speed", False),
+        )
+    if name == "BenchmarkSingleRNN":
+        return BenchmarkSingleRNN(
+            hidden_dim=cfg["model"]["hidden_dim"],
+            num_layers=cfg["model"].get("num_layers", 1),
+            dropout=cfg["model"].get("dropout", 0.0),
+            use_bbox=cfg["model"].get("use_bbox", True),
+            use_bbox_displacement=cfg["model"].get("use_bbox_displacement", False),
+            use_bbox_delta=cfg["model"].get("use_bbox_delta", False),
+            use_ego_speed=cfg["model"].get("use_ego_speed", True),
+        )
+    if name == "TransformerModalityNet":
+        # obs_len effettivo: con drop_first_frame la sequenza perde 1 frame.
+        # Serve al pooling "flatten", la cui testa dipende da T fisso.
+        _obs_len = cfg["data"]["obs_len"]
+        if cfg["data"].get("drop_first_frame", False):
+            _obs_len -= 1
+        return TransformerModalityNet(
+            hidden_dim=cfg["model"]["hidden_dim"],
+            num_layers=cfg["model"]["num_layers"],
+            nhead=cfg["model"].get("nhead", 8),
+            dropout=cfg["model"].get("dropout", 0.1),
+            pooling=cfg["model"].get("pooling", "cls"),
+            obs_len=_obs_len,
+            separate_encoder_speed_kinematics=cfg["model"].get(
+                "separate_encoder_speed_kinematics", False),
+            norm_first=cfg["model"].get("norm_first", False),
+            use_input_layernorm=cfg["model"].get("use_input_layernorm", False),
+            use_bbox=cfg["model"].get("use_bbox", True),
+            use_bbox_displacement=cfg["model"].get("use_bbox_displacement", False),
+            use_bbox_delta=cfg["model"].get("use_bbox_delta", False),
+            use_ego_speed=cfg["model"].get("use_ego_speed", True),
+        )
+    raise ValueError(f"Modello non supportato: {name}.")
+
+
+# ─── Metriche ─────────────────────────────────────────────────────────────────
+
+def compute_metrics(labels: np.ndarray, preds: np.ndarray,
+                    probs: np.ndarray) -> Dict[str, float]:
+    """Calcola tutte le metriche a partire da label/pred/prob."""
+    acc       = accuracy_score(labels, preds)
+    f1        = f1_score(labels, preds, pos_label=1, zero_division=0)
+    recall    = recall_score(labels, preds, pos_label=1, zero_division=0)
+    precision = precision_score(labels, preds, pos_label=1, zero_division=0)
+    if len(np.unique(labels)) > 1:
+        auc = roc_auc_score(labels, probs)
+    else:
+        auc = 0.0
+    return {
+        "acc":       float(acc),
+        "f1":        float(f1),
+        "auc":       float(auc),
+        "precision": float(precision),
+        "recall":    float(recall),
+    }
+
+
+# ─── Train / Eval di una epoca ────────────────────────────────────────────────
+
+def run_epoch(model, loader, criterion, device, optimizer=None,
+              desc="train") -> Tuple[Dict[str, float], Dict[str, list]]:
+    """
+    Esegue una passata completa sul loader.
+    Se optimizer è passato -> training (backward + step), altrimenti eval.
+
+    Returns:
+        metrics : dict con loss, acc, f1, auc, precision, recall
+        outputs : dict con liste labels/preds/probs (per confusion matrix)
+    """
+    is_train = optimizer is not None
+    model.train() if is_train else model.eval()
+
+    total_loss, total = 0.0, 0
+    all_labels, all_preds, all_probs = [], [], []
+
+    pbar = tqdm(loader, desc=desc, leave=False, ncols=100)
+    grad_ctx = torch.enable_grad() if is_train else torch.no_grad()
+
+    with grad_ctx:
+        for batch in pbar:
+            bbox              = batch["bbox"].to(device)
+            bbox_displacement = batch["bbox_displacement"].to(device)
+            bbox_delta        = batch["bbox_delta"].to(device)
+            ego_speed         = batch["ego_speed"].to(device)
+            labels            = batch["label"].to(device)
+
+            if is_train:
+                optimizer.zero_grad()
+
+            logits = model(bbox, bbox_displacement, bbox_delta, ego_speed)
+
+            if logits.dim() == 2 and logits.shape[-1] == 1:
+                # modello benchmark: 1 logit + BCEWithLogitsLoss
+                logits1 = logits.squeeze(-1)
+                loss = criterion(logits1, labels.float())
+                probs = torch.sigmoid(logits1)
+                preds = (probs >= 0.5).long()
+            else:
+                # modello a 2 classi + CrossEntropyLoss
+                loss = criterion(logits, labels)
+                probs = torch.softmax(logits, dim=-1)[:, 1]
+                preds = logits.argmax(dim=-1)
+
+            if is_train:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+            total_loss += loss.item() * len(labels)
+            total      += len(labels)
+            all_labels.extend(labels.detach().cpu().numpy().tolist())
+            all_preds.extend(preds.detach().cpu().numpy().tolist())
+            all_probs.extend(probs.detach().cpu().numpy().tolist())
+
+            running_acc = np.mean(np.array(all_preds) == np.array(all_labels))
+            pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{running_acc:.3f}")
+
+    labels_np = np.array(all_labels)
+    preds_np  = np.array(all_preds)
+    probs_np  = np.array(all_probs)
+
+    metrics = compute_metrics(labels_np, preds_np, probs_np)
+    metrics["loss"] = total_loss / total
+
+    outputs = {
+        "labels": all_labels,
+        "preds":  all_preds,
+        "probs":  all_probs,
+    }
+    return metrics, outputs
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=None,
+                        help="sovrascrive experiment.seed del config (per run multi-seed)")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    # seed: da riga di comando se fornito, altrimenti dal config
+    seed = args.seed if args.seed is not None else cfg["experiment"]["seed"]
+    cfg["experiment"]["seed"] = seed
+    set_seed(seed)
+    device = get_device()
+
+    # se il seed e' passato esplicitamente, isola l'output in una sottocartella per-seed
+    _exp_name = cfg["experiment"]["name"]
+    if args.seed is not None:
+        _exp_name = f"{_exp_name}/seed_{seed}"
+    out_dir = Path(cfg["output"]["checkpoint_dir"]) / _exp_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "config.yaml", "w") as f:
+        yaml.dump(cfg, f)
+
+    print(f"\nEsperimento: {cfg['experiment']['name']}")
+    print(f"Config: {args.config}")
+    print(f"Output: {out_dir}\n")
+
+    # -- Dataset --------------------------------------------------------------
+    data_cfg  = cfg["data"]
+    train_cfg = cfg["training"]
+
+    _st = data_cfg.get("sample_type", "beh")
+    bbox_norm  = data_cfg.get("bbox_normalization", "raw")
+    speed_norm = data_cfg.get("speed_normalization", "raw")
+    drop_ff    = data_cfg.get("drop_first_frame", False)
+    
+    # modalita' "solo train per N epoche": disattiva il validation set
+    use_val = train_cfg.get("use_validation", True)
+
+    train_ds = PIEDataset(data_cfg["annotation_root"], split="train",
+                          obs_len=data_cfg["obs_len"],
+                          bbox_normalization=bbox_norm,
+                          speed_normalization=speed_norm,
+                          drop_first_frame=drop_ff,
+                          sample_type=_st)
+
+    train_loader = DataLoader(train_ds, batch_size=train_cfg["batch_size"],
+                              shuffle=True, num_workers=0, collate_fn=collate_fn)
+    train_eval_loader = DataLoader(train_ds, batch_size=train_cfg["batch_size"],
+                                   shuffle=False, num_workers=0, collate_fn=collate_fn)
+
+    if use_val:
+        val_ds = PIEDataset(data_cfg["annotation_root"], split="val",
+                            obs_len=data_cfg["obs_len"],
+                            bbox_normalization=bbox_norm,
+                            speed_normalization=speed_norm,
+                            drop_first_frame=drop_ff,
+                            sample_type=_st)
+        val_loader = DataLoader(val_ds, batch_size=train_cfg["batch_size"],
+                                shuffle=False, num_workers=0, collate_fn=collate_fn)
+    else:
+        val_ds = None
+        val_loader = None
+        print("\n[INFO] use_validation=False -> nessun validation set, "
+              "addestro per tutte le epoche sul solo train.")
+
+    # -- Modello --------------------------------------------------------------
+    model = build_model(cfg).to(device)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Feature attive: bbox=True, "
+          f"bbox_delta={getattr(model, 'use_bbox_delta', '?')}, "
+          f"ego_speed={getattr(model, 'use_ego_speed', '?')} "
+          f"-> input_dim={getattr(model, 'input_dim', '?')}")
+    print(f"Parametri: {n_params:,}\n")
+
+    # -- Loss / optim / scheduler --------------------------------------------
+    # Class weights: se in config c'e' class_weights: [w_neg, w_pos] usa quelli,
+    # altrimenti li calcola dal dataset (formula in get_class_weights).
+    cw_cfg = train_cfg.get("class_weights", None)
+    if cw_cfg is not None:
+        class_weights = torch.tensor([float(cw_cfg[0]), float(cw_cfg[1])],
+                                     dtype=torch.float32, device=device)
+        print(f"  Class weights (da config) -> neg={cw_cfg[0]}, pos={cw_cfg[1]}")
+    else:
+        class_weights = train_ds.get_class_weights().to(device)
+
+    _is_bce = (cfg["model"]["name"] in ["BenchmarkSingleRNN", "TransformerModalityNet"])
+    if _is_bce:
+        # Replica ESATTA del class_weight di Keras {0: w_neg, 1: w_pos}:
+        # ogni sample pesa w della sua classe (moltiplicativo), NON pos_weight.
+        _w_neg = float(class_weights[0]); _w_pos = float(class_weights[1])
+        _bce_none = nn.BCEWithLogitsLoss(reduction="none")
+        def criterion(logit1, target):
+            # logit1, target: [B]
+            per = _bce_none(logit1, target)
+            w = torch.where(target > 0.5,
+                            torch.full_like(per, _w_pos),
+                            torch.full_like(per, _w_neg))
+            return (per * w).mean()
+        print(f"  Loss: BCE per-sample pesata come Keras (neg={_w_neg}, pos={_w_pos})")
+    else:
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+    # Optimizer scelto da config: adam | adamw | rmsprop | sgd
+    opt_name = str(train_cfg.get("optimizer", "adamw")).lower()
+    wd = float(train_cfg.get("weight_decay", 0.0))
+    lr = float(train_cfg["lr"])
+    if opt_name == "rmsprop":
+        optimizer = torch.optim.RMSprop(model.parameters(), lr=lr, weight_decay=wd)
+    elif opt_name == "adam":
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    elif opt_name == "sgd":
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=wd, momentum=0.9)
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    print(f"  Optimizer: {opt_name}  lr={lr}  weight_decay={wd}")
+
+    # Scheduler: solo se richiesto in config (scheduler: cosine); default none
+    sched_name = str(train_cfg.get("scheduler", "none")).lower()
+    if sched_name == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=train_cfg["epochs"], eta_min=1e-5)
+    else:
+        scheduler = None
+        print("  Scheduler: nessuno")
+
+    # -- Resume ---------------------------------------------------------------
+    start_epoch = 1
+    best_val_f1 = 0.0
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        start_epoch = ckpt["epoch"] + 1
+        best_val_f1 = ckpt["val_metrics"]["f1"]
+        print(f"Ripreso da epoch {start_epoch} (best_f1={best_val_f1:.4f})")
+
+    # -- Training loop --------------------------------------------------------
+    patience_counter = 0
+    history = []
+    epochs = train_cfg["epochs"]
+
+    print("=== Training ===")
+    for epoch in range(start_epoch, epochs + 1):
+        t0 = time.time()
+
+        train_m, _ = run_epoch(model, train_loader, criterion, device,
+                               optimizer=optimizer,
+                               desc=f"Epoch {epoch}/{epochs} [train]")
+
+        if use_val:
+            val_m, _ = run_epoch(model, val_loader, criterion, device,
+                                 optimizer=None,
+                                 desc=f"Epoch {epoch}/{epochs} [val]  ")
+        else:
+            val_m = None
+
+        if scheduler is not None:
+            scheduler.step()
+
+        elapsed = time.time() - t0
+        lr_now  = scheduler.get_last_lr()[0] if scheduler is not None else lr
+
+        if use_val:
+            print(
+                f"Epoch {epoch:3d}/{epochs} ({elapsed:.0f}s) lr={lr_now:.2e}\n"
+                f"  TRAIN loss={train_m['loss']:.4f} acc={train_m['acc']:.4f} "
+                f"f1={train_m['f1']:.4f} auc={train_m['auc']:.4f} "
+                f"P={train_m['precision']:.4f} R={train_m['recall']:.4f}\n"
+                f"  VAL   loss={val_m['loss']:.4f} acc={val_m['acc']:.4f} "
+                f"f1={val_m['f1']:.4f} auc={val_m['auc']:.4f} "
+                f"P={val_m['precision']:.4f} R={val_m['recall']:.4f}"
+            )
+        else:
+            print(
+                f"Epoch {epoch:3d}/{epochs} ({elapsed:.0f}s) lr={lr_now:.2e}\n"
+                f"  TRAIN loss={train_m['loss']:.4f} acc={train_m['acc']:.4f} "
+                f"f1={train_m['f1']:.4f} auc={train_m['auc']:.4f} "
+                f"P={train_m['precision']:.4f} R={train_m['recall']:.4f}"
+            )
+
+        row = {"epoch": epoch,
+               **{f"train_{k}": v for k, v in train_m.items()}}
+        if use_val:
+            row.update({f"val_{k}": v for k, v in val_m.items()})
+        history.append(row)
+        with open(out_dir / "history.json", "w") as f:
+            json.dump(history, f, indent=2)
+
+        if use_val:
+            # selezione best su val f1 + early stopping
+            if val_m["f1"] > best_val_f1:
+                best_val_f1 = val_m["f1"]
+                patience_counter = 0
+                torch.save({"epoch": epoch, "model_state": model.state_dict(),
+                            "optimizer_state": optimizer.state_dict(),
+                            "val_metrics": val_m, "config": cfg},
+                           out_dir / "best_model.pt")
+                print(f"  ✓ Best model salvato (val_f1={best_val_f1:.4f})")
+            else:
+                patience_counter += 1
+                if patience_counter >= train_cfg.get("patience", 10**9):
+                    print(f"\nEarly stopping (patience={train_cfg['patience']})")
+                    break
+
+    # In modalita' senza validation salviamo il modello finale come best_model
+    if not use_val:
+        torch.save({"epoch": epochs, "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "val_metrics": None, "config": cfg},
+                   out_dir / "best_model.pt")
+        print("  Modello finale (ultima epoca) salvato come best_model.pt")
+
+    # -- Evaluation finale del best model ------------------------------------
+    print("\n=== Evaluation finale (best model) ===")
+    test_ds = PIEDataset(data_cfg["annotation_root"], split="test",
+                         obs_len=data_cfg["obs_len"],
+                         bbox_normalization=bbox_norm,
+                         speed_normalization=speed_norm,
+                         drop_first_frame=drop_ff,
+                         sample_type=_st)
+    test_loader = DataLoader(test_ds, batch_size=train_cfg["batch_size"],
+                             shuffle=False, num_workers=0, collate_fn=collate_fn)
+
+    ckpt = torch.load(out_dir / "best_model.pt", map_location=device)
+    model.load_state_dict(ckpt["model_state"])
+
+    eval_splits = [("train", train_eval_loader)]
+    if use_val:
+        eval_splits.append(("val", val_loader))
+    eval_splits.append(("test", test_loader))
+
+    final_metrics = {}
+    predictions   = {}
+    for split, loader in eval_splits:
+        m, out = run_epoch(model, loader, criterion, device,
+                           optimizer=None, desc=f"eval [{split}]")
+        final_metrics[split] = m
+        predictions[split]   = out
+        print(f"\n[{split.upper()}] "
+              f"acc={m['acc']:.4f} f1={m['f1']:.4f} auc={m['auc']:.4f} "
+              f"P={m['precision']:.4f} R={m['recall']:.4f}")
+
+    with open(out_dir / "test_results.json", "w") as f:
+        json.dump(final_metrics, f, indent=2)
+    with open(out_dir / "predictions.json", "w") as f:
+        json.dump(predictions, f, indent=2)
+
+    print(f"\nRisultati salvati in: {out_dir}")
+
+    # -- Plot automatici ------------------------------------------------------
+    plots_dir = out_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    print("\n=== Generazione grafici ===")
+    plot_metric_curves(history, plots_dir)
+    plot_confusion_matrices(predictions, plots_dir)
+    print(f"Grafici salvati in: {plots_dir}")
+
+
+if __name__ == "__main__":
+    main()

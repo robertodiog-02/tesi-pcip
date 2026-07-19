@@ -1,0 +1,33 @@
+experiment:
+  name: baseline_gru_yes_speed_no_delta
+  seed: 42
+
+data:
+  annotation_root: /Users/robertodioguardi/Desktop/PIE
+  obs_len: 16
+  bbox_normalization: image_based
+  speed_normalization: divide
+  drop_first_frame: False
+  sample_type: all
+
+model:
+  name: BaselineGRU
+  hidden_dim: 256
+  num_layers: 1
+  dropout: 0.0
+  use_bbox: true
+  use_bbox_displacement: false
+  use_bbox_delta: false
+  use_ego_speed: true
+
+training:
+  epochs: 60
+  batch_size: 16
+  lr: 5.0e-5
+  weight_decay: 0.0
+  patience: 60
+  scheduler: none
+
+output:
+  checkpoint_dir: checkpoints
+  log_dir: logs
