@@ -36,9 +36,15 @@ from torch.utils.data import Dataset
 try:
     from .geometry import (compute_pdm, compute_tripolar, pdm_dim, tripolar_dim,
                            bbox_track_feature, track_feature_dim)
+    from .pose_loader import (load_pose_index, extract_window_poses,
+                              normalize_keypoints, add_extra_joints,
+                              frame_number_from_path, skeleton_n_joints)
 except ImportError:
     from geometry import (compute_pdm, compute_tripolar, pdm_dim, tripolar_dim,
                           bbox_track_feature, track_feature_dim)
+    from pose_loader import (load_pose_index, extract_window_poses,
+                             normalize_keypoints, add_extra_joints,
+                             frame_number_from_path, skeleton_n_joints)
 
 OBS_LEN = 16
 TTE_MIN = 30   # frame (~1s)
@@ -92,12 +98,17 @@ def build_samples(
     displacement_type:   str  = "corners",  # corners|center|center_size|bottom_center
     delta_type:          str  = "corners",
     y_min:               float = None,      # vertice B delle linee PDM
+    use_skeleton:        bool = False,
+    pose_index:          Dict = None,       # da load_pose_index (richiesto se use_skeleton)
+    skeleton_norm:       str  = "bbox_topleft",
+    skeleton_add_extra_joints: bool = True,
 ) -> List[Dict]:
     """
     Costruisce i sample seguendo il protocollo temporale Kotseruba WACV 2021.
     Le normalizzazioni e lo slicing sono configurabili tramite parametri.
     """
     bboxes_all = pie_sequences["bbox"]
+    images_all = pie_sequences.get("image", None)
     intbin_all = pie_sequences.get("activities") or pie_sequences.get("intention_binary")
     obd_all    = pie_sequences.get("obd_speed", None)
     gps_all    = pie_sequences.get("gps_speed", None)
@@ -122,6 +133,14 @@ def build_samples(
               f"anchor={geom_anchor}")
     print(f"  >>> Displacement: {displacement_type} ({track_feature_dim(displacement_type)}d) | "
           f"Delta: {delta_type} ({track_feature_dim(delta_type)}d)")
+    if use_skeleton:
+        assert pose_index is not None, "use_skeleton=True richiede pose_index"
+        assert images_all is not None, (
+            "use_skeleton richiede i path immagine nelle sequenze PIE "
+            "(chiave 'image') per l'allineamento dei frame")
+        _n_j = skeleton_n_joints(skeleton_add_extra_joints)
+        print(f"  >>> Skeleton: norm={skeleton_norm}, joints={_n_j} "
+              f"(extra={skeleton_add_extra_joints})")
 
     # Y_min per le linee di riferimento del PDM: minimo y su TUTTI i campioni
     # del dataset (GTransPDM: "Ymin is the minimum yt of all samples").
@@ -135,6 +154,7 @@ def build_samples(
     eff_len = obs_len - 1 if drop_first_frame else obs_len
 
     samples = []
+    _miss_total = [0, 0]   # [frame senza posa, frame totali]
 
     for i in range(len(bboxes_all)):
         track_bboxes = bboxes_all[i]
@@ -152,6 +172,12 @@ def build_samples(
 
         obd_track = obd_all[i] if obd_all is not None else None
         gps_track = gps_all[i] if gps_all is not None else None
+
+        # numeri di frame della traccia (per l'allineamento delle pose)
+        if use_skeleton:
+            track_frames = np.array(
+                [frame_number_from_path(im) for im in images_all[i]],
+                dtype=np.int64)
 
         for w_start in range(start_idx, end_idx + 1, step):
             w_end = w_start + obs_len
@@ -207,6 +233,19 @@ def build_samples(
             else:
                 pdm_feat = np.zeros((eff_len, 1), dtype=np.float32)
 
+            if use_skeleton:
+                win_frames = track_frames[w_start:w_end]
+                kp_raw, n_miss = extract_window_poses(
+                    pose_index, ped_id, win_frames)
+                kp_norm = normalize_keypoints(kp_raw, obs_bboxes, skeleton_norm)
+                if skeleton_add_extra_joints:
+                    kp_norm = add_extra_joints(kp_norm)
+                kp_feat = kp_norm[1:] if drop_first_frame else kp_norm
+                _miss_total[0] += n_miss
+                _miss_total[1] += len(win_frames)
+            else:
+                kp_feat = np.zeros((eff_len, 1, 3), dtype=np.float32)
+
             if use_polar:
                 pol_full = compute_tripolar(obs_bboxes, anchor=geom_anchor,
                                             include_sin=polar_include_sin,
@@ -245,6 +284,7 @@ def build_samples(
                 "bbox_delta":        bbox_delta.astype(np.float32),
                 "pdm":               pdm_feat.astype(np.float32),
                 "polar":             polar_feat.astype(np.float32),
+                "keypoints":         kp_feat.astype(np.float32),
                 "ego_speed":         ego_speed_seq.astype(np.float32),
                 "label":             np.int64(label),
             })
@@ -255,6 +295,10 @@ def build_samples(
           f"(step={step}, overlap={overlap}, eff_len={eff_len})")
     print(f"  crossing: {n_pos}, non-crossing: {n_neg} "
           f"(ratio {n_pos/max(n_neg,1):.2f}:1)")
+    if use_skeleton and _miss_total[1] > 0:
+        pct = 100.0 * _miss_total[0] / _miss_total[1]
+        print(f"  skeleton: {_miss_total[0]}/{_miss_total[1]} frame senza posa "
+              f"({pct:.1f}%) -> zero-fill")
     return samples
 
 
@@ -279,6 +323,10 @@ class PIEDataset(Dataset):
         geom_anchor:         str  = "center",
         displacement_type:   str  = "corners",
         delta_type:          str  = "corners",
+        use_skeleton:        bool = False,
+        pose_dir:            str  = "data/poses",
+        skeleton_norm:       str  = "bbox_topleft",
+        skeleton_add_extra_joints: bool = True,
         sample_type:    str = "all",
     ):
         assert split in ("train", "val", "test")
@@ -303,6 +351,11 @@ class PIEDataset(Dataset):
             data_split_type="default",
         )
 
+        pose_index = None
+        if use_skeleton:
+            print(f"Caricamento pose da {pose_dir}...")
+            pose_index = load_pose_index(pose_dir)
+
         self.samples = build_samples(
             sequences, obs_len,
             bbox_normalization=bbox_normalization,
@@ -317,6 +370,10 @@ class PIEDataset(Dataset):
             geom_anchor=geom_anchor,
             displacement_type=displacement_type,
             delta_type=delta_type,
+            use_skeleton=use_skeleton,
+            pose_index=pose_index,
+            skeleton_norm=skeleton_norm,
+            skeleton_add_extra_joints=skeleton_add_extra_joints,
         )
 
         # dimensioni effettive delle feature (servono a costruire il modello)
@@ -326,6 +383,8 @@ class PIEDataset(Dataset):
                           if use_polar else 0)
         self.displacement_dim = track_feature_dim(displacement_type)
         self.delta_dim = track_feature_dim(delta_type)
+        self.skeleton_joints = (skeleton_n_joints(skeleton_add_extra_joints)
+                                if use_skeleton else 0)
 
     def __len__(self):
         return len(self.samples)
@@ -338,6 +397,7 @@ class PIEDataset(Dataset):
             "bbox_delta":        torch.from_numpy(s["bbox_delta"]),
             "pdm":               torch.from_numpy(s["pdm"]),
             "polar":             torch.from_numpy(s["polar"]),
+            "keypoints":         torch.from_numpy(s["keypoints"]),
             "ego_speed":         torch.from_numpy(s["ego_speed"]),
             "label":             torch.tensor(s["label"], dtype=torch.long),
             "ped_id":            s["ped_id"],

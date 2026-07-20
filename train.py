@@ -75,7 +75,7 @@ def load_config(config_path: str) -> Dict:
 def collate_fn(batch):
     """Collate: bbox, bbox_displacement, bbox_delta, ego_speed, label (+ ped_id meta)."""
     keys_tensor = ["bbox", "bbox_displacement", "bbox_delta",
-                   "pdm", "polar", "ego_speed", "label"]
+                   "pdm", "polar", "keypoints", "ego_speed", "label"]
     out = {k: torch.stack([b[k] for b in batch]) for k in keys_tensor}
     out["ped_id"] = [b["ped_id"] for b in batch]
     return out
@@ -102,6 +102,11 @@ def _polar_dim(cfg: Dict) -> int:
     return d * 2 if cfg["data"].get("polar_add_deltas", False) else d
 
 
+def _skeleton_joints(cfg: Dict) -> int:
+    """N giunti coerente con la config dataset: 20 con i punti extra, 17 senza."""
+    return 20 if cfg["data"].get("skeleton_add_extra_joints", True) else 17
+
+
 def build_model(cfg: Dict) -> nn.Module:
     name = cfg["model"]["name"]
     if name == "BaselineGRU":
@@ -112,13 +117,7 @@ def build_model(cfg: Dict) -> nn.Module:
             use_bbox=cfg["model"].get("use_bbox", True),
             use_bbox_displacement=cfg["model"].get("use_bbox_displacement", False),
             use_bbox_delta=cfg["model"].get("use_bbox_delta", True),
-            use_pdm=cfg["data"].get("use_pdm", False),
-            use_polar=cfg["data"].get("use_polar", False),
             use_ego_speed=cfg["model"].get("use_ego_speed", False),
-            pdm_dim=_pdm_dim(cfg),
-            polar_dim=_polar_dim(cfg),
-            displacement_dim=_track_dim(cfg, "displacement_type"),
-            delta_dim=_track_dim(cfg, "delta_type"),
         )
     if name == "BenchmarkSingleRNN":
         return BenchmarkSingleRNN(
@@ -159,6 +158,12 @@ def build_model(cfg: Dict) -> nn.Module:
             use_bbox_displacement=cfg["model"].get("use_bbox_displacement", False),
             use_bbox_delta=cfg["model"].get("use_bbox_delta", False),
             use_ego_speed=cfg["model"].get("use_ego_speed", True),
+            # skeleton: use_skeleton vive sotto `data:` (le pose nascono nel
+            # dataset), i parametri architetturali sotto `model:`
+            use_skeleton=cfg["data"].get("use_skeleton", False),
+            skeleton_n_joints=_skeleton_joints(cfg),
+            skeleton_hidden=cfg["model"].get("skeleton_hidden", 64),
+            skeleton_layers=cfg["model"].get("skeleton_layers", 4),
         )
     raise ValueError(f"Modello non supportato: {name}.")
 
@@ -214,6 +219,7 @@ def run_epoch(model, loader, criterion, device, optimizer=None,
             ego_speed         = batch["ego_speed"].to(device)
             pdm               = batch["pdm"].to(device)
             polar             = batch["polar"].to(device)
+            keypoints         = batch["keypoints"].to(device)
             labels            = batch["label"].to(device)
 
             if is_train:
@@ -221,6 +227,9 @@ def run_epoch(model, loader, criterion, device, optimizer=None,
 
             if isinstance(model, BenchmarkSingleRNN):
                 logits = model(bbox, bbox_displacement, bbox_delta, ego_speed)
+            elif isinstance(model, TransformerModalityNet):
+                logits = model(bbox, bbox_displacement, bbox_delta, ego_speed,
+                               pdm=pdm, polar=polar, keypoints=keypoints)
             else:
                 logits = model(bbox, bbox_displacement, bbox_delta, ego_speed,
                                pdm=pdm, polar=polar)
@@ -314,6 +323,10 @@ def main():
         geom_anchor=data_cfg.get("geom_anchor", "center"),
         displacement_type=data_cfg.get("displacement_type", "corners"),
         delta_type=data_cfg.get("delta_type", "corners"),
+        use_skeleton=data_cfg.get("use_skeleton", False),
+        pose_dir=data_cfg.get("pose_dir", "data/poses"),
+        skeleton_norm=data_cfg.get("skeleton_norm", "bbox_topleft"),
+        skeleton_add_extra_joints=data_cfg.get("skeleton_add_extra_joints", True),
     )
     
     # modalita' "solo train per N epoche": disattiva il validation set
@@ -343,18 +356,10 @@ def main():
         val_loader = DataLoader(val_ds, batch_size=train_cfg["batch_size"],
                                 shuffle=False, num_workers=0, collate_fn=collate_fn)
     else:
-        # Quando use_validation è False, valutiamo a fine epoca sul TEST set
-        # senza fare model selection (l'ultimo checkpoint salvato sara' quello dell'ultima epoca).
-        val_ds = PIEDataset(data_cfg["annotation_root"], split="test",
-                            obs_len=data_cfg["obs_len"],
-                            bbox_normalization=bbox_norm,
-                            speed_normalization=speed_norm,
-                            drop_first_frame=drop_ff,
-                            **_geom,
-                            sample_type=_st)
-        val_loader = DataLoader(val_ds, batch_size=train_cfg["batch_size"],
-                                shuffle=False, num_workers=0, collate_fn=collate_fn)
-        print("\n[INFO] use_validation=False -> valutazione a fine epoca sul TEST set (niente early stopping).")
+        val_ds = None
+        val_loader = None
+        print("\n[INFO] use_validation=False -> nessun validation set, "
+              "addestro per tutte le epoche sul solo train.")
 
     # -- Modello --------------------------------------------------------------
     model = build_model(cfg).to(device)
@@ -445,9 +450,7 @@ def main():
                                  optimizer=None,
                                  desc=f"Epoch {epoch}/{epochs} [val]  ")
         else:
-            val_m, _ = run_epoch(model, val_loader, criterion, device,
-                                 optimizer=None,
-                                 desc=f"Epoch {epoch}/{epochs} [test] ")
+            val_m = None
 
         if scheduler is not None:
             scheduler.step()
@@ -470,42 +473,40 @@ def main():
                 f"Epoch {epoch:3d}/{epochs} ({elapsed:.0f}s) lr={lr_now:.2e}\n"
                 f"  TRAIN loss={train_m['loss']:.4f} acc={train_m['acc']:.4f} "
                 f"f1={train_m['f1']:.4f} auc={train_m['auc']:.4f} "
-                f"P={train_m['precision']:.4f} R={train_m['recall']:.4f}\n"
-                f"  TEST  loss={val_m['loss']:.4f} acc={val_m['acc']:.4f} "
-                f"f1={val_m['f1']:.4f} auc={val_m['auc']:.4f} "
-                f"P={val_m['precision']:.4f} R={val_m['recall']:.4f}"
+                f"P={train_m['precision']:.4f} R={train_m['recall']:.4f}"
             )
 
         row = {"epoch": epoch,
-               **{f"train_{k}": v for k, v in train_m.items()},
-               **{f"val_{k}": v for k, v in val_m.items()}}
+               **{f"train_{k}": v for k, v in train_m.items()}}
+        if use_val:
+            row.update({f"val_{k}": v for k, v in val_m.items()})
         history.append(row)
         with open(out_dir / "history.json", "w") as f:
             json.dump(history, f, indent=2)
 
-        # Salva sempre il best_model basandosi sul punteggio F1 più alto del val_loader (val o test split)
-        if val_m["f1"] > best_val_f1:
-            best_val_f1 = val_m["f1"]
-            patience_counter = 0
-            torch.save({"epoch": epoch, "model_state": model.state_dict(),
-                        "optimizer_state": optimizer.state_dict(),
-                        "val_metrics": val_m, "config": cfg},
-                       out_dir / "best_model.pt")
-            label_set = "val" if use_val else "test"
-            print(f"  ✓ Best model salvato ({label_set}_f1={best_val_f1:.4f})")
-        else:
-            if use_val:
+        if use_val:
+            # selezione best su val f1 + early stopping
+            if val_m["f1"] > best_val_f1:
+                best_val_f1 = val_m["f1"]
+                patience_counter = 0
+                torch.save({"epoch": epoch, "model_state": model.state_dict(),
+                            "optimizer_state": optimizer.state_dict(),
+                            "val_metrics": val_m, "config": cfg},
+                           out_dir / "best_model.pt")
+                print(f"  ✓ Best model salvato (val_f1={best_val_f1:.4f})")
+            else:
                 patience_counter += 1
                 if patience_counter >= train_cfg.get("patience", 10**9):
                     print(f"\nEarly stopping (patience={train_cfg['patience']})")
                     break
 
-    # Salviamo sempre il modello dell'ultima epoca come final_model.pt
-    torch.save({"epoch": epochs, "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "val_metrics": val_m, "config": cfg},
-               out_dir / "final_model.pt")
-    print("  Modello finale (ultima epoca) salvato come final_model.pt")
+    # In modalita' senza validation salviamo il modello finale come best_model
+    if not use_val:
+        torch.save({"epoch": epochs, "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "val_metrics": None, "config": cfg},
+                   out_dir / "best_model.pt")
+        print("  Modello finale (ultima epoca) salvato come best_model.pt")
 
     # -- Evaluation finale del best model ------------------------------------
     print("\n=== Evaluation finale (best model) ===")

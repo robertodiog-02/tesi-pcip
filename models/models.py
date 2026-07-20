@@ -3,7 +3,10 @@ Modelli per PIE PCIP
 ====================
 
 Gerarchia:
-  BaselineGRU     - lower bound: solo bbox + ego_speed → GRU → FCM
+  BaselineGRU     - lower bound: solo bbox + ego_speed → GRU → FC
+  BranchA_GCN     - Branch A: skeleton GCN (richiede pose cache)
+  BranchB_GAT     - Branch B: scene GAT (richiede detection objects)
+  CrossAttnDualGraph - architettura completa con CGAM
 """
 
 from typing import Optional, Tuple, Dict
@@ -94,21 +97,133 @@ class BaselineGRU(nn.Module):
             features.append(bbox_displacement)
         if self.use_bbox_delta:
             features.append(bbox_delta)
-        if self.use_pdm:
+        if self.use_pdm and pdm is not None:
             features.append(pdm)
-        if self.use_polar:
+        if self.use_polar and polar is not None:
             features.append(polar)
         if self.use_ego_speed:
             features.append(ego_speed)
         x = torch.cat(features, dim=-1)      # [B, T, input_dim]
 
-        
         gru_out, _ = self.gru(x)
-
-
 
         logits = self.decoder(gru_out[:, -1, :])  # [B, 2]
         return logits
+
+
+
+
+# ─── Skeleton Pose Encoder (GTransPDM, eq. 6-7) ──────────────────────────────
+
+# Scheletro COCO-17: connessioni anatomiche naturali
+_COCO17_EDGES = [
+    (0, 1), (0, 2), (1, 3), (2, 4),            # testa
+    (5, 6),                                     # spalle
+    (5, 7), (7, 9), (6, 8), (8, 10),           # braccia
+    (5, 11), (6, 12), (11, 12),                # torso
+    (11, 13), (13, 15), (12, 14), (14, 16),    # gambe
+]
+# Punti extra GTransPDM (17=neck, 18=hip, 19=body center) e i loro archi
+_EXTRA_EDGES = [
+    (17, 0), (17, 5), (17, 6),      # neck: naso e spalle
+    (18, 11), (18, 12),             # hip: anche
+    (19, 17), (19, 18),             # body center: neck e hip
+]
+
+
+def _build_adjacency(n_joints: int) -> torch.Tensor:
+    """
+    A_hat = D^{-1/2} (A + I) D^{-1/2}   (GTransPDM eq. 6)
+    Adiacenza anatomica + self-connections, normalizzazione simmetrica.
+    """
+    A = torch.zeros(n_joints, n_joints)
+    edges = list(_COCO17_EDGES)
+    if n_joints == 20:
+        edges += _EXTRA_EDGES
+    for i, j in edges:
+        A[i, j] = 1.0
+        A[j, i] = 1.0
+    A = A + torch.eye(n_joints)
+    deg = A.sum(-1)
+    d = deg.pow(-0.5)
+    d[torch.isinf(d)] = 0.0
+    D = torch.diag(d)
+    return D @ A @ D
+
+
+class SkeletonEncoder(nn.Module):
+    """
+    Skeleton Pose Encoder di GTransPDM (eq. 6-7), fedele al paper:
+
+        A_hat = D^{-1/2} A D^{-1/2}
+        X_i   = BatchNorm(K_i)
+        H_0   = sigma( (E_0 (*) A_hat) X_i W_0 )
+        H_l   = sigma( (E_l (*) A_hat) H_{l-1} W_l + Conv2D(H_{l-1}) )   l=1,2,3
+        X_ke  = FC( Flatten(H_3) )
+
+    dove (*) e' il prodotto di Hadamard ed E_l e' la matrice di edge
+    importance APPRENDIBILE di ciascun layer (una per layer, come nel paper:
+    "learnable edge importance was also applied"). Il primo blocco non ha
+    residuo; i blocchi 1-3 hanno il residuo Conv2D 1x1 esplicito.
+
+    Il Flatten e' sui GIUNTI (N x d_hid), NON sul tempo: l'output e'
+    [B, T, C_d] e la dimensione temporale resta intatta per il Transformer.
+    """
+
+    def __init__(
+        self,
+        n_joints: int = 20,
+        in_channels: int = 3,        # (x, y, confidence)
+        hidden_channels: int = 64,   # d_hid (GTransPDM: 64)
+        out_dim: int = 64,           # C_d
+        n_layers: int = 4,
+    ):
+        super().__init__()
+        self.n_joints = n_joints
+        adj = _build_adjacency(n_joints)
+        self.register_buffer("adj", adj)
+
+        # X_i = BatchNorm(K_i) sull'input
+        self.input_bn = nn.BatchNorm1d(in_channels * n_joints)
+
+        dims = [in_channels] + [hidden_channels] * n_layers
+        self.edge_importance = nn.ParameterList(
+            [nn.Parameter(torch.ones_like(adj)) for _ in range(n_layers)]
+        )
+        self.weights = nn.ModuleList(
+            [nn.Linear(dims[l], dims[l + 1], bias=False) for l in range(n_layers)]
+        )
+        # Residuo Conv2D 1x1 per i layer 1..n-1 (il layer 0 non ce l'ha)
+        self.residuals = nn.ModuleList(
+            [nn.Conv2d(dims[l], dims[l + 1], kernel_size=1)
+             for l in range(1, n_layers)]
+        )
+        self.relu = nn.ReLU()
+        self.fc_out = nn.Linear(n_joints * hidden_channels, out_dim)
+
+    def forward(self, keypoints: torch.Tensor) -> torch.Tensor:
+        """keypoints: [B, T, N, 3] -> [B, T, out_dim]"""
+        B, T, N, C = keypoints.shape
+
+        # BatchNorm sull'input
+        x = keypoints.reshape(B, T, N * C).transpose(1, 2)   # [B, N*C, T]
+        x = self.input_bn(x).transpose(1, 2).reshape(B, T, N, C)
+
+        for l, (E, W) in enumerate(zip(self.edge_importance, self.weights)):
+            adj = self.adj * E                                # E_l (*) A_hat
+            h = torch.matmul(adj, x.reshape(B * T, N, -1).view(B, T, N, -1))
+            # matmul broadcasting: [N,N] @ [B,T,N,C] -> [B,T,N,C]
+            h = W(h)
+            if l == 0:
+                x = self.relu(h)                              # H_0: no residuo
+            else:
+                # Conv2D(H_{l-1}): [B, C, T, N]
+                res = self.residuals[l - 1](
+                    x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+                x = self.relu(h + res)
+
+        # Flatten sui giunti, FC -> [B, T, C_d]  (eq. 7)
+        return self.fc_out(x.reshape(B, T, -1))
 
 
 class TransformerModalityNet(nn.Module):
@@ -174,6 +289,12 @@ class TransformerModalityNet(nn.Module):
     `use_bbox_displacement`, `use_bbox_delta` e `use_ego_speed` sono
     indipendenti e restano attivabili con qualunque combinazione.
 
+    SKELETON — `use_skeleton` attiva lo Skeleton Pose Encoder di GTransPDM
+    (eq. 6-7): 4 blocchi GCN con edge importance apprendibile e residui
+    Conv2D, flatten sui giunti, FC -> X_ke [B,T,C_d]. Con la fusione
+    gerarchica X_ke e' il terzo ramo dell'eq. 8: X = FC(Concat[X_pe, X_ev,
+    X_ke]); con la fusione piatta viene concatenato alle altre proiezioni.
+
     STABILITA' — due opzioni indipendenti, entrambe disattivate di default:
 
     `norm_first` (Pre-LN): sposta la LayerNorm PRIMA di attention e FFN dentro
@@ -211,6 +332,10 @@ class TransformerModalityNet(nn.Module):
         use_bbox_displacement: bool = False,
         use_bbox_delta: bool  = False,
         use_ego_speed:  bool  = True,
+        use_skeleton:   bool  = False,
+        skeleton_n_joints: int = 20,       # 20 = 17 COCO + neck/hip/center (GTransPDM)
+        skeleton_hidden: int  = 64,        # d_hid
+        skeleton_layers: int  = 4,
     ):
         super().__init__()
         assert pooling in ("cls", "last", "mean", "flatten"), \
@@ -241,6 +366,7 @@ class TransformerModalityNet(nn.Module):
         self.use_bbox_displacement = use_bbox_displacement
         self.use_bbox_delta = use_bbox_delta
         self.use_ego_speed = use_ego_speed
+        self.use_skeleton = use_skeleton
 
         # 1. Proiezioni lineari separate (una per feature, pesi distinti)
         self.projections = nn.ModuleDict()
@@ -257,7 +383,18 @@ class TransformerModalityNet(nn.Module):
         if use_ego_speed:
             self.projections["speed"] = nn.Linear(1, hidden_dim)
 
-        n_modalities = len(self.projections)
+        # Skeleton Pose Encoder (GTransPDM eq. 6-7): ramo a parte, il suo
+        # output X_ke [B,T,C_d] entra nella fusione come una modalita'.
+        self.skeleton_encoder = (
+            SkeletonEncoder(
+                n_joints=skeleton_n_joints,
+                hidden_channels=skeleton_hidden,
+                out_dim=hidden_dim,
+                n_layers=skeleton_layers,
+            ) if use_skeleton else None
+        )
+
+        n_modalities = len(self.projections) + int(use_skeleton)
         assert n_modalities > 0, (
             "Almeno una feature di input deve essere attiva (use_bbox, "
             "use_polar, use_pdm, use_bbox_displacement, use_bbox_delta o "
@@ -279,7 +416,8 @@ class TransformerModalityNet(nn.Module):
             self.proj_ego = nn.Linear(hidden_dim, hidden_dim) if use_ego_speed else None
 
             # Livello 2: fusione tra encoder (GTransPDM eq. 8)
-            n_branches = int(n_kin > 0) + int(use_ego_speed)
+            # X = FC(Concat[X_pe, X_ev, X_ke])
+            n_branches = int(n_kin > 0) + int(use_ego_speed) + int(use_skeleton)
             self.proj_fusion = nn.Linear(n_branches * hidden_dim, hidden_dim)
             self.proj_joint = None
         else:
@@ -326,6 +464,7 @@ class TransformerModalityNet(nn.Module):
         ego_speed:         torch.Tensor = None,
         pdm:               torch.Tensor = None,
         polar:             torch.Tensor = None,
+        keypoints:         torch.Tensor = None,   # [B, T, N, 3]
     ) -> torch.Tensor:
         B, T = bbox.shape[0], bbox.shape[1]
 
@@ -353,7 +492,11 @@ class TransformerModalityNet(nn.Module):
                 x_ev = self.proj_ego(self.projections["speed"](ego_speed))
                 branches.append(x_ev)                       # [B, T, d_model]
 
-            # ── Livello 2: fusione tra encoder ──
+            # ── Livello 1c: ramo skeleton (X_ke, eq. 6-7) ──
+            if self.use_skeleton:
+                branches.append(self.skeleton_encoder(keypoints))  # [B, T, d_model]
+
+            # ── Livello 2: fusione tra encoder (eq. 8) ──
             x = self.proj_fusion(torch.cat(branches, dim=-1))  # [B, T, d_model]
         else:
             # ── Fusione piatta: tutto insieme ──
@@ -370,6 +513,9 @@ class TransformerModalityNet(nn.Module):
                 proj_feats.append(self.projections["box_delta"](bbox_delta))
             if self.use_ego_speed:
                 proj_feats.append(self.projections["speed"](ego_speed))
+
+            if self.use_skeleton:
+                proj_feats.append(self.skeleton_encoder(keypoints))
 
             x = torch.cat(proj_feats, dim=-1)   # [B, T, n_modalities * d_model]
             x = self.proj_joint(x)              # [B, T, d_model]
