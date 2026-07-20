@@ -19,6 +19,7 @@ cache/
 *.h5
 *.hdf5
 *.npz
+*.pkl
 
 # Python
 __pycache__/
