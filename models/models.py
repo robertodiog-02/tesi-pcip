@@ -39,32 +39,19 @@ class BaselineGRU(nn.Module):
         use_bbox:       bool  = True,
         use_bbox_displacement: bool = False,
         use_bbox_delta: bool  = True,
-        use_pdm:        bool  = False,
-        use_polar:      bool  = False,
         use_ego_speed:  bool  = False,
-        pdm_dim:        int   = 3,
-        polar_dim:      int   = 6,
-        displacement_dim: int = 4,
-        delta_dim:      int   = 4,
     ):
         super().__init__()
         self.use_bbox = use_bbox
-        self.use_bbox_displacement = use_bbox_displacement
-        self.use_bbox_delta = use_bbox_delta
         self.use_pdm = use_pdm
         self.use_polar = use_polar
+        self.use_bbox_displacement = use_bbox_displacement
+        self.use_bbox_delta = use_bbox_delta
         self.use_ego_speed  = use_ego_speed
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
 
-        input_dim = (
-            (4 if use_bbox else 0)
-            + (displacement_dim if use_bbox_displacement else 0)
-            + (delta_dim if use_bbox_delta else 0)
-            + (pdm_dim if use_pdm else 0)
-            + (polar_dim if use_polar else 0)
-            + (1 if use_ego_speed else 0)
-        )
+        input_dim = (4 if use_bbox else 0) + (4 if use_bbox_displacement else 0) + (4 if use_bbox_delta else 0) + (1 if use_ego_speed else 0)
         self.input_dim = input_dim
 
 
@@ -86,8 +73,6 @@ class BaselineGRU(nn.Module):
         bbox_displacement: torch.Tensor = None,     # [B, T, 4]
         bbox_delta:        torch.Tensor = None,     # [B, T, 4]
         ego_speed:         torch.Tensor = None,     # [B, T, 1]
-        pdm:               torch.Tensor = None,     # [B, T, pdm_dim]
-        polar:             torch.Tensor = None,     # [B, T, polar_dim]
     ) -> torch.Tensor:                       # [B, 2]
 
         features = []
@@ -97,15 +82,14 @@ class BaselineGRU(nn.Module):
             features.append(bbox_displacement)
         if self.use_bbox_delta:
             features.append(bbox_delta)
-        if self.use_pdm and pdm is not None:
-            features.append(pdm)
-        if self.use_polar and polar is not None:
-            features.append(polar)
         if self.use_ego_speed:
             features.append(ego_speed)
         x = torch.cat(features, dim=-1)      # [B, T, input_dim]
 
+        
         gru_out, _ = self.gru(x)
+
+
 
         logits = self.decoder(gru_out[:, -1, :])  # [B, 2]
         return logits
@@ -226,6 +210,57 @@ class SkeletonEncoder(nn.Module):
         return self.fc_out(x.reshape(B, T, -1))
 
 
+
+
+class AttentionPooling(nn.Module):
+    """
+    Attention pooling: media pesata dei token, con pesi appresi dal contenuto.
+
+        score_t = w^T tanh(W h_t + b)
+        alpha   = softmax(score)
+        out     = sum_t alpha_t * h_t
+
+    A differenza di "mean" (che pesa tutti i frame uguale) e di "last"/"cls"
+    (che ne privilegiano uno fisso), qui il modello impara QUALI frame contano
+    per la decisione — e i pesi sono ispezionabili, utile per capire su quale
+    parte della finestra si concentra.
+    """
+
+    def __init__(self, d_model: int, hidden: int = None):
+        super().__init__()
+        hidden = hidden or d_model
+        self.proj = nn.Linear(d_model, hidden)
+        self.score = nn.Linear(hidden, 1, bias=False)
+
+    def forward(self, x: torch.Tensor, return_weights: bool = False):
+        """x: [B, T, D] -> [B, D]"""
+        a = self.score(torch.tanh(self.proj(x)))      # [B, T, 1]
+        w = torch.softmax(a, dim=1)                   # [B, T, 1]
+        out = (w * x).sum(dim=1)                      # [B, D]
+        return (out, w.squeeze(-1)) if return_weights else out
+
+
+def _build_head(in_dim: int, out_dim: int, n_layers: int,
+                hidden: int, dropout: float) -> nn.Module:
+    """
+    Testa di classificazione: singolo Linear (n_layers=1) o MLP.
+
+    Con pooling="flatten" l'input e' T*d_model (es. 16*64=1024): un solo
+    Linear 1024->1 e' una regressione lineare sui token concatenati, mentre
+    un MLP puo' modellare interazioni tra istanti diversi. Con gli altri
+    pooling l'input e' d_model e il singolo layer di solito basta.
+    """
+    if n_layers <= 1:
+        return nn.Linear(in_dim, out_dim)
+    layers = []
+    d = in_dim
+    for _ in range(n_layers - 1):
+        layers += [nn.Linear(d, hidden), nn.ReLU(), nn.Dropout(dropout)]
+        d = hidden
+    layers.append(nn.Linear(d, out_dim))
+    return nn.Sequential(*layers)
+
+
 class TransformerModalityNet(nn.Module):
     """
     Transformer Modality Network.
@@ -248,10 +283,16 @@ class TransformerModalityNet(nn.Module):
         finche' non sono entrambi nello stesso spazio di rappresentazione.
 
     POOLING — come si collassa la dimensione temporale prima della testa:
-        "cls"     : token CLS appreso (stile BERT/ViT)
-        "last"    : ultimo token = frame piu' vicino all'evento
-        "mean"    : global average pooling su tutti i token
-        "flatten" : concatena tutti i T token -> FC   (GTransPDM eq. 9)
+        "cls"       : token CLS appreso (stile BERT/ViT)
+        "last"      : ultimo token = frame piu' vicino all'evento
+        "mean"      : global average pooling su tutti i token
+        "flatten"   : concatena tutti i T token -> testa (GTransPDM eq. 9)
+        "attention" : media pesata dei token, pesi appresi dal contenuto
+
+    TESTA — `head_layers=1` da' un singolo Linear (comportamento originale);
+    >1 costruisce un MLP con ReLU e dropout. Utile soprattutto con "flatten",
+    dove l'input e' T*d_model e un solo Linear e' una regressione lineare sui
+    token concatenati.
 
     NOTA su "flatten": la testa dipende da T fisso, quindi va passato
     `obs_len` corretto (16, oppure 15 con drop_first_frame).
@@ -316,7 +357,10 @@ class TransformerModalityNet(nn.Module):
         num_layers:     int   = 4,
         nhead:          int   = 8,
         dropout:        float = 0.1,
-        pooling:        str   = "cls",        # "cls" | "last" | "mean" | "flatten"
+        pooling:        str   = "cls",        # cls|last|mean|flatten|attention
+        head_layers:    int   = 1,            # 1 = Linear singolo, >1 = MLP
+        head_hidden:    int   = None,         # dim nascosta MLP (default: hidden_dim)
+        head_dropout:   float = 0.1,
         max_len:        int   = 512,
         obs_len:        int   = 16,           # serve solo a pooling="flatten"
         separate_encoder_speed_kinematics: bool = False,
@@ -338,7 +382,7 @@ class TransformerModalityNet(nn.Module):
         skeleton_layers: int  = 4,
     ):
         super().__init__()
-        assert pooling in ("cls", "last", "mean", "flatten"), \
+        assert pooling in ("cls", "last", "mean", "flatten", "attention"), \
             f"pooling non valido: {pooling}"
 
         # use_bbox e use_polar sono ALTERNATIVI (al massimo uno dei due):
@@ -408,12 +452,19 @@ class TransformerModalityNet(nn.Module):
                          use_bbox_displacement, use_bbox_delta])
             self.n_kin = n_kin
 
-            # ramo cinematico (GTransPDM eq. 3)
+            # Ramo cinematico (GTransPDM eq. 3). Come sopra: con una sola
+            # feature attiva la proiezione di fusione e' ridondante.
             self.proj_kinematics = (
-                nn.Linear(n_kin * hidden_dim, hidden_dim) if n_kin > 0 else None
+                nn.Linear(n_kin * hidden_dim, hidden_dim) if n_kin > 1 else None
             )
-            # ramo ego-motion (GTransPDM eq. 5)
-            self.proj_ego = nn.Linear(hidden_dim, hidden_dim) if use_ego_speed else None
+            # Ramo ego-motion (GTransPDM eq. 5): X_ev = FC(Concat[FC(S), FC(Acc)]).
+            # Con UNA SOLA feature (solo speed, senza accelerazione) la FC
+            # esterna diventa una seconda lineare in fila sulla stessa
+            # grandezza scalare: ridondante e peggiora il condizionamento.
+            # In quel caso la saltiamo.
+            self.n_ego = int(use_ego_speed)
+            self.proj_ego = (nn.Linear(hidden_dim, hidden_dim)
+                             if self.n_ego > 1 else None)
 
             # Livello 2: fusione tra encoder (GTransPDM eq. 8)
             # X = FC(Concat[X_pe, X_ev, X_ke])
@@ -450,11 +501,13 @@ class TransformerModalityNet(nn.Module):
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
+        # 5b. Attention pooling (solo se pooling="attention")
+        self.attn_pool = AttentionPooling(hidden_dim) if pooling == "attention" else None
+
         # 6. Classification Head (1 logit per BCEWithLogitsLoss)
-        if pooling == "flatten":
-            self.decoder = nn.Linear(obs_len * hidden_dim, 1)
-        else:
-            self.decoder = nn.Linear(hidden_dim, 1)
+        head_in = obs_len * hidden_dim if pooling == "flatten" else hidden_dim
+        self.decoder = _build_head(
+            head_in, 1, head_layers, head_hidden or hidden_dim, head_dropout)
 
     def forward(
         self,
@@ -484,12 +537,16 @@ class TransformerModalityNet(nn.Module):
 
             branches = []
             if kin_feats:
-                x_pe = self.proj_kinematics(torch.cat(kin_feats, dim=-1))
+                x_pe = torch.cat(kin_feats, dim=-1)
+                if self.proj_kinematics is not None:
+                    x_pe = self.proj_kinematics(x_pe)
                 branches.append(x_pe)                       # [B, T, d_model]
 
             # ── Livello 1b: ramo ego-motion (speed), percorso separato ──
             if self.use_ego_speed:
-                x_ev = self.proj_ego(self.projections["speed"](ego_speed))
+                x_ev = self.projections["speed"](ego_speed)
+                if self.proj_ego is not None:
+                    x_ev = self.proj_ego(x_ev)
                 branches.append(x_ev)                       # [B, T, d_model]
 
             # ── Livello 1c: ramo skeleton (X_ke, eq. 6-7) ──
@@ -541,6 +598,8 @@ class TransformerModalityNet(nn.Module):
             feat = x[:, -1]                 # [B, d_model]
         elif self.pooling == "mean":
             feat = x.mean(dim=1)            # [B, d_model]
+        elif self.pooling == "attention":
+            feat = self.attn_pool(x)        # [B, d_model], pesi appresi
         else:  # flatten (GTransPDM eq. 9)
             feat = x.reshape(B, -1)         # [B, T * d_model]
 

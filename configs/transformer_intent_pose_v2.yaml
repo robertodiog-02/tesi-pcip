@@ -1,0 +1,167 @@
+experiment:
+  name: transformer_intent_model_last_token_pose_kinematics_speed
+  seed: 42
+
+data:
+  annotation_root: /Users/robertodioguardi/Desktop/PIE
+  obs_len: 16
+  bbox_normalization: image_based  # 'raw' or 'image_based'
+  speed_normalization: raw      # 'raw' or 'divide'
+  drop_first_frame: False          # Keep full 16 frames
+
+  # ── POSIZIONE ASSOLUTA: use_bbox (model:) oppure use_polar ────────────────
+  # Codificano la stessa informazione — dove si trova il pedone nel piano
+  # immagine — in due sistemi di coordinate diversi, quindi al massimo UNA
+  # delle due puo' essere attiva. Nessuna delle due e' pero' obbligatoria:
+  # il modello gira anche senza posizione assoluta (es. solo ego_speed).
+  # L'unico requisito e' che almeno UNA feature qualsiasi sia attiva.
+  #
+  # ── MOTO RELATIVO ALLA SCENA: use_pdm, indipendente ───────────────────────
+  # Il PDM NON e' alternativo ai due sopra: si combina con entrambi.
+  # Non dice dove si trova il pedone (le differenze temporali eliminano la
+  # posizione assoluta), ma come si muove rispetto alle linee che delimitano
+  # la ROI di attraversamento — piu' l'area ratio come proxy di profondita'.
+  #
+  # Combinazioni valide (con qualunque sottoinsieme di displacement/delta/speed):
+  #   bbox                 (baseline)
+  #   bbox  + pdm
+  #   polar
+  #   polar + pdm          (posizione polare + moto relativo + depth cue)
+  #   pdm                  (senza posizione assoluta)
+  #   nessuna delle tre    (solo displacement/delta/speed)
+  # NON valida: bbox + polar insieme.
+
+  # use_pdm — Position Decoupling Module (GTransPDM eq. 2)
+  #   Linee A=(0,H)->B=(W/2,Ymin) e B->C=(W,H). Feature = differenze temporali
+  #   della disparita' dalla linea + R=(A_t/A_{t-1}-1)*100.
+  #   -> 3 feature (2 se pdm_use_area_ratio: false)
+  use_pdm: false
+  pdm_use_area_ratio: true
+  # keep_absolute: tiene anche dx, dy ASSOLUTI oltre alle loro differenze.
+  # GTransPDM deriva e butta via gli assoluti, quindi il PDM dice "mi sto
+  # avvicinando alla linea" ma non "quanto sono vicino". Con true recuperi
+  # anche quella informazione: 3 feature -> 5. Deviazione dal paper, ablabile.
+  pdm_keep_absolute: false
+
+  # use_polar — coordinate quasi-polari a tre poli (PCIP sez. III-D)
+  #   Poli O1=(0,H), O2=(W/2,H), O3=(W,H). Per ciascuno (cos theta, dist).
+  #   NOTA: PCIP seleziona dinamicamente il polo piu' vicino; qui usiamo TUTTI
+  #   e tre, perche' la selezione dinamica crea discontinuita' temporali quando
+  #   il polo cambia tra frame consecutivi.
+  #   -> 6 feature (9 con sin, raddoppiate con deltas)
+  use_polar: false
+  polar_include_sin: false
+  polar_add_deltas: false
+
+  # Punto della bbox usato per PDM e polare:
+  #   center | bottom_center (piedi, contatto col suolo) | top_left
+  geom_anchor: center
+
+  # ── Punto di riferimento per displacement e delta ─────────────────────────
+  #   corners       : [x1,y1,x2,y2] — entrambi gli angoli (default storico).
+  #                   4 dim. Contiene implicitamente traslazione E cambio di
+  #                   scala, mescolati.
+  #   center        : centro della box, 2 dim. E' la definizione di GTransPDM
+  #                   per D_i e V_i: la traiettoria e' il moto del centro.
+  #   center_size   : (cx, cy, w, h), 4 dim. Traslazione e scala separate
+  #                   esplicitamente invece che mescolate negli angoli.
+  #   bottom_center : piedi del pedone, 2 dim. Punto di contatto col suolo.
+  displacement_type: corners
+  delta_type: corners
+
+  # ── Skeleton Pose Encoder (GTransPDM eq. 6-7) ─────────────────────────────
+  # Pose estratte con HigherHRNet sulle crop dei pedoni: 17 keypoint COCO
+  # (x, y, confidence) in pixel grezzi, un pickle per set in pose_dir.
+  # L'allineamento finestra<->pose avviene per NUMERO DI FRAME.
+  use_skeleton: true
+  pose_dir: data/poses
+
+  # Normalizzazione dei keypoint (GTransPDM: sottrazione del top-left bbox):
+  #   bbox_topleft        : (x', y') = (x - x1, y - y1). Fedele al paper;
+  #                         la scala resta in pixel.
+  #   bbox_topleft_scaled : come sopra ma diviso per (w, h) -> ~[0,1],
+  #                         invariante alla distanza. Deviazione ablabile.
+  #   none                : keypoint grezzi.
+  skeleton_norm: bbox_topleft_scaled
+
+  # true -> 20 giunti come GTransPDM (17 COCO + neck, hip, body center
+  # calcolati come media dei punti adiacenti); false -> 17 COCO puri.
+  skeleton_add_extra_joints: true
+
+  sample_type: all
+
+model:
+  name: TransformerModalityNet
+  hidden_dim: 64                  # d_model (dimensione embedding per frame)
+  num_layers: 4                    # numero di layer Transformer Encoder
+  nhead: 4                         # numero di attention heads (hidden_dim deve essere divisibile per nhead)
+  dropout: 0.1
+  # Pooling — come si collassa la dimensione temporale prima della testa:
+  #   cls     : token CLS appreso (stile BERT/ViT)
+  #   last    : ultimo token = frame piu' vicino all'evento
+  #   mean    : global average pooling su tutti i token
+  #   flatten   : concatena tutti i T token -> testa (GTransPDM eq. 9)
+  #   attention : media pesata dei token, pesi appresi dal contenuto
+  pooling: last
+
+  # Testa di classificazione: 1 = singolo Linear (comportamento originale),
+  # >1 = MLP con ReLU+dropout. Conta soprattutto con pooling: flatten, dove
+  # l'input e' T*hidden_dim (1024 con T=16, d=64) e un solo Linear e' una
+  # regressione lineare sui token concatenati.
+  head_layers: 1
+  head_hidden: null        # null -> usa hidden_dim
+  head_dropout: 0.1
+
+  # Fusione delle modalita':
+  #   false : fusione piatta — bbox, displacement, delta E speed proiettati,
+  #           concatenati e riproiettati tutti insieme (comportamento attuale)
+  #   true  : fusione gerarchica stile GTransPDM —
+  #             X_pe = FC(Concat[FC(bbox), FC(disp), FC(delta)])   (eq. 3)
+  #             X_ev = FC(FC(speed))                               (eq. 5)
+  #             x    = FC(Concat[X_pe, X_ev])                      (eq. 8)
+  #           la cinematica del pedone e il moto dell'ego restano separati
+  separate_encoder_speed_kinematics: true
+
+  # Pre-LN: LayerNorm PRIMA di attention/FFN dentro ogni layer del Transformer,
+  # invece che dopo (Post-LN, default PyTorch). Generalmente piu' stabile su
+  # dataset piccoli e reti addestrate da zero.
+  norm_first: false
+
+  # LayerNorm applicata alla sequenza subito prima del Transformer (dopo il
+  # positional encoding). Utile quando le feature hanno scale molto diverse
+  # tra loro (bbox in [0,1], displacement in pixel, speed in km/h).
+  use_input_layernorm: false
+
+  # Architettura dello Skeleton Pose Encoder (attivo solo se use_skeleton
+  # sotto `data:`): d_hid dei blocchi GCN e numero di blocchi.
+  skeleton_hidden: 64
+  skeleton_layers: 4
+
+  # Posizione assoluta cartesiana della bbox [x1,y1,x2,y2].
+  # Incompatibile con use_polar (sotto `data:`), ma non obbligatoria:
+  # puo' stare a false senza attivare nulla al suo posto.
+  # use_pdm invece si combina liberamente, non sostituisce.
+  use_bbox: true
+
+  use_bbox_displacement: true
+  use_bbox_delta: false
+  use_ego_speed: true
+
+training:
+  epochs: 40
+  batch_size: 16
+  lr: 5.0e-5
+  weight_decay: 0.0001
+  patience: 60
+  scheduler: none
+  use_validation: false            # Allineato a benchmark_singlernn per addestrare sul dataset completo
+
+  # Class weights della loss: [w_neg, w_pos].
+  # Con BCE viene usato come pos_weight = w_pos / w_neg.
+  class_weights:
+    - 1.0
+    - 3.0
+
+output:
+  checkpoint_dir: checkpoints
+  log_dir: logs

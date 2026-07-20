@@ -141,6 +141,9 @@ def build_model(cfg: Dict) -> nn.Module:
             nhead=cfg["model"].get("nhead", 8),
             dropout=cfg["model"].get("dropout", 0.1),
             pooling=cfg["model"].get("pooling", "cls"),
+            head_layers=cfg["model"].get("head_layers", 1),
+            head_hidden=cfg["model"].get("head_hidden", None),
+            head_dropout=cfg["model"].get("head_dropout", 0.1),
             obs_len=_obs_len,
             separate_encoder_speed_kinematics=cfg["model"].get(
                 "separate_encoder_speed_kinematics", False),
@@ -225,14 +228,11 @@ def run_epoch(model, loader, criterion, device, optimizer=None,
             if is_train:
                 optimizer.zero_grad()
 
-            if isinstance(model, BenchmarkSingleRNN):
-                logits = model(bbox, bbox_displacement, bbox_delta, ego_speed)
-            elif isinstance(model, TransformerModalityNet):
+            if isinstance(model, TransformerModalityNet):
                 logits = model(bbox, bbox_displacement, bbox_delta, ego_speed,
                                pdm=pdm, polar=polar, keypoints=keypoints)
             else:
-                logits = model(bbox, bbox_displacement, bbox_delta, ego_speed,
-                               pdm=pdm, polar=polar)
+                logits = model(bbox, bbox_displacement, bbox_delta, ego_speed)
 
             if logits.dim() == 2 and logits.shape[-1] == 1:
                 # modello benchmark: 1 logit + BCEWithLogitsLoss
