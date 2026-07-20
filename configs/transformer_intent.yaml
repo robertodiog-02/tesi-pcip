@@ -1,5 +1,5 @@
 experiment:
-  name: transformer_intent_model_last_token_layernormfirst_inputlayernorm
+  name: transformer_intent_model_last_token_again_4
   seed: 42
 
 data:
@@ -8,6 +8,67 @@ data:
   bbox_normalization: image_based  # 'raw' or 'image_based'
   speed_normalization: raw      # 'raw' or 'divide'
   drop_first_frame: False          # Keep full 16 frames
+
+  # ── POSIZIONE ASSOLUTA: use_bbox (model:) oppure use_polar ────────────────
+  # Codificano la stessa informazione — dove si trova il pedone nel piano
+  # immagine — in due sistemi di coordinate diversi, quindi al massimo UNA
+  # delle due puo' essere attiva. Nessuna delle due e' pero' obbligatoria:
+  # il modello gira anche senza posizione assoluta (es. solo ego_speed).
+  # L'unico requisito e' che almeno UNA feature qualsiasi sia attiva.
+  #
+  # ── MOTO RELATIVO ALLA SCENA: use_pdm, indipendente ───────────────────────
+  # Il PDM NON e' alternativo ai due sopra: si combina con entrambi.
+  # Non dice dove si trova il pedone (le differenze temporali eliminano la
+  # posizione assoluta), ma come si muove rispetto alle linee che delimitano
+  # la ROI di attraversamento — piu' l'area ratio come proxy di profondita'.
+  #
+  # Combinazioni valide (con qualunque sottoinsieme di displacement/delta/speed):
+  #   bbox                 (baseline)
+  #   bbox  + pdm
+  #   polar
+  #   polar + pdm          (posizione polare + moto relativo + depth cue)
+  #   pdm                  (senza posizione assoluta)
+  #   nessuna delle tre    (solo displacement/delta/speed)
+  # NON valida: bbox + polar insieme.
+
+  # use_pdm — Position Decoupling Module (GTransPDM eq. 2)
+  #   Linee A=(0,H)->B=(W/2,Ymin) e B->C=(W,H). Feature = differenze temporali
+  #   della disparita' dalla linea + R=(A_t/A_{t-1}-1)*100.
+  #   -> 3 feature (2 se pdm_use_area_ratio: false)
+  use_pdm: false
+  pdm_use_area_ratio: true
+  # keep_absolute: tiene anche dx, dy ASSOLUTI oltre alle loro differenze.
+  # GTransPDM deriva e butta via gli assoluti, quindi il PDM dice "mi sto
+  # avvicinando alla linea" ma non "quanto sono vicino". Con true recuperi
+  # anche quella informazione: 3 feature -> 5. Deviazione dal paper, ablabile.
+  pdm_keep_absolute: false
+
+  # use_polar — coordinate quasi-polari a tre poli (PCIP sez. III-D)
+  #   Poli O1=(0,H), O2=(W/2,H), O3=(W,H). Per ciascuno (cos theta, dist).
+  #   NOTA: PCIP seleziona dinamicamente il polo piu' vicino; qui usiamo TUTTI
+  #   e tre, perche' la selezione dinamica crea discontinuita' temporali quando
+  #   il polo cambia tra frame consecutivi.
+  #   -> 6 feature (9 con sin, raddoppiate con deltas)
+  use_polar: false
+  polar_include_sin: false
+  polar_add_deltas: false
+
+  # Punto della bbox usato per PDM e polare:
+  #   center | bottom_center (piedi, contatto col suolo) | top_left
+  geom_anchor: center
+
+  # ── Punto di riferimento per displacement e delta ─────────────────────────
+  #   corners       : [x1,y1,x2,y2] — entrambi gli angoli (default storico).
+  #                   4 dim. Contiene implicitamente traslazione E cambio di
+  #                   scala, mescolati.
+  #   center        : centro della box, 2 dim. E' la definizione di GTransPDM
+  #                   per D_i e V_i: la traiettoria e' il moto del centro.
+  #   center_size   : (cx, cy, w, h), 4 dim. Traslazione e scala separate
+  #                   esplicitamente invece che mescolate negli angoli.
+  #   bottom_center : piedi del pedone, 2 dim. Punto di contatto col suolo.
+  displacement_type: corners
+  delta_type: corners
+
   sample_type: all
 
 model:
@@ -36,14 +97,19 @@ model:
   # Pre-LN: LayerNorm PRIMA di attention/FFN dentro ogni layer del Transformer,
   # invece che dopo (Post-LN, default PyTorch). Generalmente piu' stabile su
   # dataset piccoli e reti addestrate da zero.
-  norm_first: true
+  norm_first: false
 
   # LayerNorm applicata alla sequenza subito prima del Transformer (dopo il
   # positional encoding). Utile quando le feature hanno scale molto diverse
   # tra loro (bbox in [0,1], displacement in pixel, speed in km/h).
   use_input_layernorm: false
 
+  # Posizione assoluta cartesiana della bbox [x1,y1,x2,y2].
+  # Incompatibile con use_polar (sotto `data:`), ma non obbligatoria:
+  # puo' stare a false senza attivare nulla al suo posto.
+  # use_pdm invece si combina liberamente, non sostituisce.
   use_bbox: true
+
   use_bbox_displacement: true
   use_bbox_delta: false
   use_ego_speed: true

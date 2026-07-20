@@ -33,6 +33,13 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+try:
+    from .geometry import (compute_pdm, compute_tripolar, pdm_dim, tripolar_dim,
+                           bbox_track_feature, track_feature_dim)
+except ImportError:
+    from geometry import (compute_pdm, compute_tripolar, pdm_dim, tripolar_dim,
+                          bbox_track_feature, track_feature_dim)
+
 OBS_LEN = 16
 TTE_MIN = 30   # frame (~1s)
 TTE_MAX = 60   # frame (~2s)
@@ -75,6 +82,16 @@ def build_samples(
     bbox_normalization:  str = "raw",       # "raw" or "image_based"
     speed_normalization: str = "raw",       # "raw" or "divide"
     drop_first_frame:    bool = False,      # If True, drops first frame (len = obs_len-1)
+    use_pdm:             bool = False,      # GTransPDM Position Decoupling Module
+    use_polar:           bool = False,      # PCIP quasi-polare a tre poli
+    pdm_use_area_ratio:  bool = True,
+    pdm_keep_absolute:   bool = False,
+    polar_include_sin:   bool = False,
+    polar_add_deltas:    bool = False,
+    geom_anchor:         str  = "center",
+    displacement_type:   str  = "corners",  # corners|center|center_size|bottom_center
+    delta_type:          str  = "corners",
+    y_min:               float = None,      # vertice B delle linee PDM
 ) -> List[Dict]:
     """
     Costruisce i sample seguendo il protocollo temporale Kotseruba WACV 2021.
@@ -98,6 +115,21 @@ def build_samples(
     print(f"  ego-speed disponibile: "
           f"{'SI' if (obd_all is not None and gps_all is not None) else 'NO'}")
     print(f"  >>> Bbox Norm: {bbox_normalization} | Speed Norm: {speed_normalization} | Drop First: {drop_first_frame}")
+    if use_pdm or use_polar:
+        print(f"  >>> Geometria: PDM={use_pdm} (area_ratio={pdm_use_area_ratio}, "
+              f"keep_abs={pdm_keep_absolute}) | "
+              f"Polar={use_polar} (sin={polar_include_sin}, deltas={polar_add_deltas}) | "
+              f"anchor={geom_anchor}")
+    print(f"  >>> Displacement: {displacement_type} ({track_feature_dim(displacement_type)}d) | "
+          f"Delta: {delta_type} ({track_feature_dim(delta_type)}d)")
+
+    # Y_min per le linee di riferimento del PDM: minimo y su TUTTI i campioni
+    # del dataset (GTransPDM: "Ymin is the minimum yt of all samples").
+    if use_pdm and y_min is None:
+        _ys = [np.asarray(tb, dtype=np.float32)[:, 1].min()
+               for tb in bboxes_all if len(tb) > 0]
+        y_min = float(np.min(_ys)) if _ys else 0.0
+        print(f"  >>> PDM Y_min calcolato dal dataset: {y_min:.1f}")
 
     step = max(1, round(obs_len * (1.0 - overlap)))
     eff_len = obs_len - 1 if drop_first_frame else obs_len
@@ -140,20 +172,48 @@ def build_samples(
             else:
                 bbox_feat = obs_bboxes_norm
 
-            # 2. Relative displacement from first frame of window (always raw pixels)
-            bbox_disp_full = obs_bboxes - obs_bboxes[0:1]
+            # 2. Relative displacement from first frame of window (raw pixels).
+            #    Il punto di riferimento e' configurabile: "corners" usa i due
+            #    angoli (comportamento storico), "center" il centro della box
+            #    (definizione di GTransPDM per D_i: la traiettoria e' il moto
+            #    del centro), "center_size" separa traslazione e scala.
+            disp_src = bbox_track_feature(obs_bboxes, displacement_type)
+            bbox_disp_full = disp_src - disp_src[0:1]
             if drop_first_frame:
                 bbox_disp = bbox_disp_full[1:]
             else:
                 bbox_disp = bbox_disp_full
 
-            # 3. Delta frame-by-frame (always raw pixels)
-            bbox_delta_full = np.zeros_like(obs_bboxes)
-            bbox_delta_full[1:] = obs_bboxes[1:] - obs_bboxes[:-1]
+            # 3. Delta frame-by-frame (raw pixels), stesso discorso
+            delta_src = bbox_track_feature(obs_bboxes, delta_type)
+            bbox_delta_full = np.zeros_like(delta_src)
+            bbox_delta_full[1:] = delta_src[1:] - delta_src[:-1]
             if drop_first_frame:
                 bbox_delta = bbox_delta_full[1:]
             else:
                 bbox_delta = bbox_delta_full
+
+            # --- FEATURE GEOMETRICHE (su PIXEL GREZZI, prima di ogni norm) ---
+            # PDM e polare sono definiti sul piano immagine (linee di
+            # riferimento e poli in coordinate pixel), quindi vanno calcolati
+            # da obs_bboxes non normalizzate. La normalizzazione avviene
+            # dentro le funzioni stesse.
+            if use_pdm:
+                pdm_full = compute_pdm(obs_bboxes, y_min=y_min,
+                                       anchor=geom_anchor,
+                                       use_area_ratio=pdm_use_area_ratio,
+                                       keep_absolute=pdm_keep_absolute)
+                pdm_feat = pdm_full[1:] if drop_first_frame else pdm_full
+            else:
+                pdm_feat = np.zeros((eff_len, 1), dtype=np.float32)
+
+            if use_polar:
+                pol_full = compute_tripolar(obs_bboxes, anchor=geom_anchor,
+                                            include_sin=polar_include_sin,
+                                            add_deltas=polar_add_deltas)
+                polar_feat = pol_full[1:] if drop_first_frame else pol_full
+            else:
+                polar_feat = np.zeros((eff_len, 1), dtype=np.float32)
 
             # --- PREPROCESSO SPEED ---
             ego_speed_seq = np.zeros((eff_len, 1), dtype=np.float32)
@@ -183,6 +243,8 @@ def build_samples(
                 "bbox":              bbox_feat.astype(np.float32),
                 "bbox_displacement": bbox_disp.astype(np.float32),
                 "bbox_delta":        bbox_delta.astype(np.float32),
+                "pdm":               pdm_feat.astype(np.float32),
+                "polar":             polar_feat.astype(np.float32),
                 "ego_speed":         ego_speed_seq.astype(np.float32),
                 "label":             np.int64(label),
             })
@@ -208,6 +270,15 @@ class PIEDataset(Dataset):
         bbox_normalization:  str = "raw",
         speed_normalization: str = "raw",
         drop_first_frame:    bool = False,
+        use_pdm:             bool = False,
+        use_polar:           bool = False,
+        pdm_use_area_ratio:  bool = True,
+        pdm_keep_absolute:   bool = False,
+        polar_include_sin:   bool = False,
+        polar_add_deltas:    bool = False,
+        geom_anchor:         str  = "center",
+        displacement_type:   str  = "corners",
+        delta_type:          str  = "corners",
         sample_type:    str = "all",
     ):
         assert split in ("train", "val", "test")
@@ -237,7 +308,24 @@ class PIEDataset(Dataset):
             bbox_normalization=bbox_normalization,
             speed_normalization=speed_normalization,
             drop_first_frame=drop_first_frame,
+            use_pdm=use_pdm,
+            use_polar=use_polar,
+            pdm_use_area_ratio=pdm_use_area_ratio,
+            pdm_keep_absolute=pdm_keep_absolute,
+            polar_include_sin=polar_include_sin,
+            polar_add_deltas=polar_add_deltas,
+            geom_anchor=geom_anchor,
+            displacement_type=displacement_type,
+            delta_type=delta_type,
         )
+
+        # dimensioni effettive delle feature (servono a costruire il modello)
+        self.pdm_dim = (pdm_dim(pdm_use_area_ratio, pdm_keep_absolute)
+                        if use_pdm else 0)
+        self.polar_dim = (tripolar_dim(polar_include_sin, polar_add_deltas)
+                          if use_polar else 0)
+        self.displacement_dim = track_feature_dim(displacement_type)
+        self.delta_dim = track_feature_dim(delta_type)
 
     def __len__(self):
         return len(self.samples)
@@ -248,6 +336,8 @@ class PIEDataset(Dataset):
             "bbox":              torch.from_numpy(s["bbox"]),
             "bbox_displacement": torch.from_numpy(s["bbox_displacement"]),
             "bbox_delta":        torch.from_numpy(s["bbox_delta"]),
+            "pdm":               torch.from_numpy(s["pdm"]),
+            "polar":             torch.from_numpy(s["polar"]),
             "ego_speed":         torch.from_numpy(s["ego_speed"]),
             "label":             torch.tensor(s["label"], dtype=torch.long),
             "ped_id":            s["ped_id"],

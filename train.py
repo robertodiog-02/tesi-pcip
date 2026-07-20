@@ -74,10 +74,32 @@ def load_config(config_path: str) -> Dict:
 
 def collate_fn(batch):
     """Collate: bbox, bbox_displacement, bbox_delta, ego_speed, label (+ ped_id meta)."""
-    keys_tensor = ["bbox", "bbox_displacement", "bbox_delta", "ego_speed", "label"]
+    keys_tensor = ["bbox", "bbox_displacement", "bbox_delta",
+                   "pdm", "polar", "ego_speed", "label"]
     out = {k: torch.stack([b[k] for b in batch]) for k in keys_tensor}
     out["ped_id"] = [b["ped_id"] for b in batch]
     return out
+
+
+def _pdm_dim(cfg: Dict) -> int:
+    """Dimensione delle feature PDM, coerente con la config del dataset."""
+    return (2
+            + int(cfg["data"].get("pdm_use_area_ratio", True))
+            + 2 * int(cfg["data"].get("pdm_keep_absolute", False)))
+
+
+_TRACK_DIMS = {"corners": 4, "center": 2, "center_size": 4, "bottom_center": 2}
+
+
+def _track_dim(cfg: Dict, key: str) -> int:
+    """Dimensione di displacement/delta secondo il punto di riferimento scelto."""
+    return _TRACK_DIMS[cfg["data"].get(key, "corners")]
+
+
+def _polar_dim(cfg: Dict) -> int:
+    """Dimensione delle feature quasi-polari, coerente con la config."""
+    d = 9 if cfg["data"].get("polar_include_sin", False) else 6
+    return d * 2 if cfg["data"].get("polar_add_deltas", False) else d
 
 
 def build_model(cfg: Dict) -> nn.Module:
@@ -90,7 +112,13 @@ def build_model(cfg: Dict) -> nn.Module:
             use_bbox=cfg["model"].get("use_bbox", True),
             use_bbox_displacement=cfg["model"].get("use_bbox_displacement", False),
             use_bbox_delta=cfg["model"].get("use_bbox_delta", True),
+            use_pdm=cfg["data"].get("use_pdm", False),
+            use_polar=cfg["data"].get("use_polar", False),
             use_ego_speed=cfg["model"].get("use_ego_speed", False),
+            pdm_dim=_pdm_dim(cfg),
+            polar_dim=_polar_dim(cfg),
+            displacement_dim=_track_dim(cfg, "displacement_type"),
+            delta_dim=_track_dim(cfg, "delta_type"),
         )
     if name == "BenchmarkSingleRNN":
         return BenchmarkSingleRNN(
@@ -120,6 +148,14 @@ def build_model(cfg: Dict) -> nn.Module:
             norm_first=cfg["model"].get("norm_first", False),
             use_input_layernorm=cfg["model"].get("use_input_layernorm", False),
             use_bbox=cfg["model"].get("use_bbox", True),
+            # use_pdm / use_polar vivono sotto `data:` perche' le feature sono
+            # calcolate nel dataset: unica fonte di verita', niente disallineamenti.
+            use_pdm=cfg["data"].get("use_pdm", False),
+            use_polar=cfg["data"].get("use_polar", False),
+            pdm_dim=_pdm_dim(cfg),
+            polar_dim=_polar_dim(cfg),
+            displacement_dim=_track_dim(cfg, "displacement_type"),
+            delta_dim=_track_dim(cfg, "delta_type"),
             use_bbox_displacement=cfg["model"].get("use_bbox_displacement", False),
             use_bbox_delta=cfg["model"].get("use_bbox_delta", False),
             use_ego_speed=cfg["model"].get("use_ego_speed", True),
@@ -176,12 +212,18 @@ def run_epoch(model, loader, criterion, device, optimizer=None,
             bbox_displacement = batch["bbox_displacement"].to(device)
             bbox_delta        = batch["bbox_delta"].to(device)
             ego_speed         = batch["ego_speed"].to(device)
+            pdm               = batch["pdm"].to(device)
+            polar             = batch["polar"].to(device)
             labels            = batch["label"].to(device)
 
             if is_train:
                 optimizer.zero_grad()
 
-            logits = model(bbox, bbox_displacement, bbox_delta, ego_speed)
+            if isinstance(model, BenchmarkSingleRNN):
+                logits = model(bbox, bbox_displacement, bbox_delta, ego_speed)
+            else:
+                logits = model(bbox, bbox_displacement, bbox_delta, ego_speed,
+                               pdm=pdm, polar=polar)
 
             if logits.dim() == 2 and logits.shape[-1] == 1:
                 # modello benchmark: 1 logit + BCEWithLogitsLoss
@@ -262,6 +304,17 @@ def main():
     bbox_norm  = data_cfg.get("bbox_normalization", "raw")
     speed_norm = data_cfg.get("speed_normalization", "raw")
     drop_ff    = data_cfg.get("drop_first_frame", False)
+    _geom = dict(
+        use_pdm=data_cfg.get("use_pdm", False),
+        use_polar=data_cfg.get("use_polar", False),
+        pdm_use_area_ratio=data_cfg.get("pdm_use_area_ratio", True),
+        pdm_keep_absolute=data_cfg.get("pdm_keep_absolute", False),
+        polar_include_sin=data_cfg.get("polar_include_sin", False),
+        polar_add_deltas=data_cfg.get("polar_add_deltas", False),
+        geom_anchor=data_cfg.get("geom_anchor", "center"),
+        displacement_type=data_cfg.get("displacement_type", "corners"),
+        delta_type=data_cfg.get("delta_type", "corners"),
+    )
     
     # modalita' "solo train per N epoche": disattiva il validation set
     use_val = train_cfg.get("use_validation", True)
@@ -271,6 +324,7 @@ def main():
                           bbox_normalization=bbox_norm,
                           speed_normalization=speed_norm,
                           drop_first_frame=drop_ff,
+                          **_geom,
                           sample_type=_st)
 
     train_loader = DataLoader(train_ds, batch_size=train_cfg["batch_size"],
@@ -284,14 +338,23 @@ def main():
                             bbox_normalization=bbox_norm,
                             speed_normalization=speed_norm,
                             drop_first_frame=drop_ff,
+                            **_geom,
                             sample_type=_st)
         val_loader = DataLoader(val_ds, batch_size=train_cfg["batch_size"],
                                 shuffle=False, num_workers=0, collate_fn=collate_fn)
     else:
-        val_ds = None
-        val_loader = None
-        print("\n[INFO] use_validation=False -> nessun validation set, "
-              "addestro per tutte le epoche sul solo train.")
+        # Quando use_validation è False, valutiamo a fine epoca sul TEST set
+        # senza fare model selection (l'ultimo checkpoint salvato sara' quello dell'ultima epoca).
+        val_ds = PIEDataset(data_cfg["annotation_root"], split="test",
+                            obs_len=data_cfg["obs_len"],
+                            bbox_normalization=bbox_norm,
+                            speed_normalization=speed_norm,
+                            drop_first_frame=drop_ff,
+                            **_geom,
+                            sample_type=_st)
+        val_loader = DataLoader(val_ds, batch_size=train_cfg["batch_size"],
+                                shuffle=False, num_workers=0, collate_fn=collate_fn)
+        print("\n[INFO] use_validation=False -> valutazione a fine epoca sul TEST set (niente early stopping).")
 
     # -- Modello --------------------------------------------------------------
     model = build_model(cfg).to(device)
@@ -382,7 +445,9 @@ def main():
                                  optimizer=None,
                                  desc=f"Epoch {epoch}/{epochs} [val]  ")
         else:
-            val_m = None
+            val_m, _ = run_epoch(model, val_loader, criterion, device,
+                                 optimizer=None,
+                                 desc=f"Epoch {epoch}/{epochs} [test] ")
 
         if scheduler is not None:
             scheduler.step()
@@ -405,40 +470,42 @@ def main():
                 f"Epoch {epoch:3d}/{epochs} ({elapsed:.0f}s) lr={lr_now:.2e}\n"
                 f"  TRAIN loss={train_m['loss']:.4f} acc={train_m['acc']:.4f} "
                 f"f1={train_m['f1']:.4f} auc={train_m['auc']:.4f} "
-                f"P={train_m['precision']:.4f} R={train_m['recall']:.4f}"
+                f"P={train_m['precision']:.4f} R={train_m['recall']:.4f}\n"
+                f"  TEST  loss={val_m['loss']:.4f} acc={val_m['acc']:.4f} "
+                f"f1={val_m['f1']:.4f} auc={val_m['auc']:.4f} "
+                f"P={val_m['precision']:.4f} R={val_m['recall']:.4f}"
             )
 
         row = {"epoch": epoch,
-               **{f"train_{k}": v for k, v in train_m.items()}}
-        if use_val:
-            row.update({f"val_{k}": v for k, v in val_m.items()})
+               **{f"train_{k}": v for k, v in train_m.items()},
+               **{f"val_{k}": v for k, v in val_m.items()}}
         history.append(row)
         with open(out_dir / "history.json", "w") as f:
             json.dump(history, f, indent=2)
 
-        if use_val:
-            # selezione best su val f1 + early stopping
-            if val_m["f1"] > best_val_f1:
-                best_val_f1 = val_m["f1"]
-                patience_counter = 0
-                torch.save({"epoch": epoch, "model_state": model.state_dict(),
-                            "optimizer_state": optimizer.state_dict(),
-                            "val_metrics": val_m, "config": cfg},
-                           out_dir / "best_model.pt")
-                print(f"  ✓ Best model salvato (val_f1={best_val_f1:.4f})")
-            else:
+        # Salva sempre il best_model basandosi sul punteggio F1 più alto del val_loader (val o test split)
+        if val_m["f1"] > best_val_f1:
+            best_val_f1 = val_m["f1"]
+            patience_counter = 0
+            torch.save({"epoch": epoch, "model_state": model.state_dict(),
+                        "optimizer_state": optimizer.state_dict(),
+                        "val_metrics": val_m, "config": cfg},
+                       out_dir / "best_model.pt")
+            label_set = "val" if use_val else "test"
+            print(f"  ✓ Best model salvato ({label_set}_f1={best_val_f1:.4f})")
+        else:
+            if use_val:
                 patience_counter += 1
                 if patience_counter >= train_cfg.get("patience", 10**9):
                     print(f"\nEarly stopping (patience={train_cfg['patience']})")
                     break
 
-    # In modalita' senza validation salviamo il modello finale come best_model
-    if not use_val:
-        torch.save({"epoch": epochs, "model_state": model.state_dict(),
-                    "optimizer_state": optimizer.state_dict(),
-                    "val_metrics": None, "config": cfg},
-                   out_dir / "best_model.pt")
-        print("  Modello finale (ultima epoca) salvato come best_model.pt")
+    # Salviamo sempre il modello dell'ultima epoca come final_model.pt
+    torch.save({"epoch": epochs, "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "val_metrics": val_m, "config": cfg},
+               out_dir / "final_model.pt")
+    print("  Modello finale (ultima epoca) salvato come final_model.pt")
 
     # -- Evaluation finale del best model ------------------------------------
     print("\n=== Evaluation finale (best model) ===")
@@ -447,6 +514,7 @@ def main():
                          bbox_normalization=bbox_norm,
                          speed_normalization=speed_norm,
                          drop_first_frame=drop_ff,
+                         **_geom,
                          sample_type=_st)
     test_loader = DataLoader(test_ds, batch_size=train_cfg["batch_size"],
                              shuffle=False, num_workers=0, collate_fn=collate_fn)

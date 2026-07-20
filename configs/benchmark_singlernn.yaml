@@ -1,14 +1,14 @@
 # Replica del SingleRNN di PedestrianActionBenchmark (box + speed su PIE)
 # Modello: Concatenate -> GRU(256) -> Dense(1), preprocessing benchmark.
 experiment:
-  name: benchmark_singlernn_weightsdifferent_onlydisplacement
+  name: benchmark_singlernn
   seed: 42
 
 data:
   annotation_root: /Users/robertodioguardi/Desktop/PIE
   obs_len: 16
   bbox_normalization: image_based #raw or image_based
-  speed_normalization: divide # raw or divide
+  speed_normalization: raw # raw or divide
   drop_first_frame: True
   sample_type: all
 
@@ -20,7 +20,7 @@ model:
   use_bbox: false
   use_bbox_displacement: true
   use_bbox_delta: false
-  use_ego_speed: false
+  use_ego_speed: true
 
 training:
   epochs: 60
