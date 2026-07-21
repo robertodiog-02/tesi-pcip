@@ -356,10 +356,17 @@ def main():
         val_loader = DataLoader(val_ds, batch_size=train_cfg["batch_size"],
                                 shuffle=False, num_workers=0, collate_fn=collate_fn)
     else:
-        val_ds = None
-        val_loader = None
-        print("\n[INFO] use_validation=False -> nessun validation set, "
-              "addestro per tutte le epoche sul solo train.")
+        # Quando use_validation è False, valutiamo a fine epoca sul TEST set
+        val_ds = PIEDataset(data_cfg["annotation_root"], split="test",
+                            obs_len=data_cfg["obs_len"],
+                            bbox_normalization=bbox_norm,
+                            speed_normalization=speed_norm,
+                            drop_first_frame=drop_ff,
+                            **_geom,
+                            sample_type=_st)
+        val_loader = DataLoader(val_ds, batch_size=train_cfg["batch_size"],
+                                shuffle=False, num_workers=0, collate_fn=collate_fn)
+        print("\n[INFO] use_validation=False -> valutazione a fine epoca sul TEST set (niente early stopping).")
 
     # -- Modello --------------------------------------------------------------
     model = build_model(cfg).to(device)
@@ -450,7 +457,9 @@ def main():
                                  optimizer=None,
                                  desc=f"Epoch {epoch}/{epochs} [val]  ")
         else:
-            val_m = None
+            val_m, _ = run_epoch(model, val_loader, criterion, device,
+                                 optimizer=None,
+                                 desc=f"Epoch {epoch}/{epochs} [test] ")
 
         if scheduler is not None:
             scheduler.step()
@@ -473,40 +482,42 @@ def main():
                 f"Epoch {epoch:3d}/{epochs} ({elapsed:.0f}s) lr={lr_now:.2e}\n"
                 f"  TRAIN loss={train_m['loss']:.4f} acc={train_m['acc']:.4f} "
                 f"f1={train_m['f1']:.4f} auc={train_m['auc']:.4f} "
-                f"P={train_m['precision']:.4f} R={train_m['recall']:.4f}"
+                f"P={train_m['precision']:.4f} R={train_m['recall']:.4f}\n"
+                f"  TEST  loss={val_m['loss']:.4f} acc={val_m['acc']:.4f} "
+                f"f1={val_m['f1']:.4f} auc={val_m['auc']:.4f} "
+                f"P={val_m['precision']:.4f} R={val_m['recall']:.4f}"
             )
 
         row = {"epoch": epoch,
-               **{f"train_{k}": v for k, v in train_m.items()}}
-        if use_val:
-            row.update({f"val_{k}": v for k, v in val_m.items()})
+               **{f"train_{k}": v for k, v in train_m.items()},
+               **{f"val_{k}": v for k, v in val_m.items()}}
         history.append(row)
         with open(out_dir / "history.json", "w") as f:
             json.dump(history, f, indent=2)
 
-        if use_val:
-            # selezione best su val f1 + early stopping
-            if val_m["f1"] > best_val_f1:
-                best_val_f1 = val_m["f1"]
-                patience_counter = 0
-                torch.save({"epoch": epoch, "model_state": model.state_dict(),
-                            "optimizer_state": optimizer.state_dict(),
-                            "val_metrics": val_m, "config": cfg},
-                           out_dir / "best_model.pt")
-                print(f"  ✓ Best model salvato (val_f1={best_val_f1:.4f})")
-            else:
+        # Salva il best_model se l'F1 del val_loader (val o test split) migliora
+        if val_m["f1"] > best_val_f1:
+            best_val_f1 = val_m["f1"]
+            patience_counter = 0
+            torch.save({"epoch": epoch, "model_state": model.state_dict(),
+                        "optimizer_state": optimizer.state_dict(),
+                        "val_metrics": val_m, "config": cfg},
+                       out_dir / "best_model.pt")
+            label_set = "val" if use_val else "test"
+            print(f"  ✓ Best model salvato ({label_set}_f1={best_val_f1:.4f})")
+        else:
+            if use_val:
                 patience_counter += 1
                 if patience_counter >= train_cfg.get("patience", 10**9):
                     print(f"\nEarly stopping (patience={train_cfg['patience']})")
                     break
 
-    # In modalita' senza validation salviamo il modello finale come best_model
-    if not use_val:
-        torch.save({"epoch": epochs, "model_state": model.state_dict(),
-                    "optimizer_state": optimizer.state_dict(),
-                    "val_metrics": None, "config": cfg},
-                   out_dir / "best_model.pt")
-        print("  Modello finale (ultima epoca) salvato come best_model.pt")
+    # Salva sempre il modello dell'ultima epoca come final_model.pt
+    torch.save({"epoch": epochs, "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "val_metrics": val_m, "config": cfg},
+               out_dir / "final_model.pt")
+    print("  Modello finale (ultima epoca) salvato come final_model.pt")
 
     # -- Evaluation finale del best model ------------------------------------
     print("\n=== Evaluation finale (best model) ===")

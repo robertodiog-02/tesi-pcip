@@ -21,7 +21,7 @@ model:
   use_ego_speed: true
 
 training:
-  epochs: 1
+  epochs: 60
   batch_size: 16
   lr: 5.0e-5
   weight_decay: 0.0

@@ -39,19 +39,32 @@ class BaselineGRU(nn.Module):
         use_bbox:       bool  = True,
         use_bbox_displacement: bool = False,
         use_bbox_delta: bool  = True,
+        use_pdm:        bool  = False,
+        use_polar:      bool  = False,
         use_ego_speed:  bool  = False,
+        pdm_dim:        int   = 3,
+        polar_dim:      int   = 6,
+        displacement_dim: int = 4,
+        delta_dim:      int   = 4,
     ):
         super().__init__()
         self.use_bbox = use_bbox
-        self.use_pdm = use_pdm
-        self.use_polar = use_polar
         self.use_bbox_displacement = use_bbox_displacement
         self.use_bbox_delta = use_bbox_delta
+        self.use_pdm = use_pdm
+        self.use_polar = use_polar
         self.use_ego_speed  = use_ego_speed
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
 
-        input_dim = (4 if use_bbox else 0) + (4 if use_bbox_displacement else 0) + (4 if use_bbox_delta else 0) + (1 if use_ego_speed else 0)
+        input_dim = (
+            (4 if use_bbox else 0)
+            + (displacement_dim if use_bbox_displacement else 0)
+            + (delta_dim if use_bbox_delta else 0)
+            + (pdm_dim if use_pdm else 0)
+            + (polar_dim if use_polar else 0)
+            + (1 if use_ego_speed else 0)
+        )
         self.input_dim = input_dim
 
 

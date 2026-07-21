@@ -28,7 +28,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from pose_loader import normalize_keypoints, add_extra_joints
+from pose_loader import (normalize_keypoints, add_extra_joints,
+                         frame_number_from_path)
+from windowing import iter_windows
 
 IMG_W, IMG_H = 1920.0, 1080.0
 
@@ -128,7 +130,7 @@ def visualize_window(kps_raw, bboxes, frames, out_path, add_extra=True):
 
 
 def visualize_window_grid(kps_raw, bboxes, frames, out_path,
-                          norm_mode="bbox_topleft", add_extra=True):
+                          norm_mode="bbox_topleft", add_extra=True, tte=None):
     """
     Griglia 2x16: UN PANNELLO PER FRAME.
     Riga superiore = coordinate RAW, riga inferiore = normalizzate.
@@ -179,14 +181,53 @@ def visualize_window_grid(kps_raw, bboxes, frames, out_path,
         if t == 0:
             ax.set_ylabel(f"NORM\n{norm_mode}", fontsize=9)
 
+    tte_txt = f"   |   TTE = {tte} frame dall'evento" if tte is not None else ""
     fig.suptitle(
-        f"Un pannello per frame — finestra {int(frames[0])}–{int(frames[-1])}   |   "
+        f"Un pannello per frame — finestra {int(frames[0])}–{int(frames[-1])}{tte_txt}   |   "
         f"quadrati rossi = punti extra (neck, hip, center), "
         f"tratteggio = bounding box",
         fontsize=10, y=0.99)
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     fig.savefig(out_path, dpi=115, bbox_inches="tight")
     plt.close(fig)
+
+
+def load_real_windows(pie_root, split, ped_id, obs_len, sample_type="all"):
+    """
+    Carica le finestre REALI del dataset (stesso protocollo di build_samples):
+    traccia troncata al crossing point + TTE in [30,60] + overlap 0.6.
+
+    Returns: (ped_id, bboxes [T,4], frames [T], windows [(s,e,tte), ...], label)
+    """
+    import sys as _sys
+    for p in [Path(pie_root) / "utilities", Path(__file__).parent, Path(".")]:
+        if p.exists() and str(p) not in _sys.path:
+            _sys.path.insert(0, str(p))
+    from pie_data import PIE
+
+    root = Path(pie_root) / "annotations"
+    if not (root / "annotations").exists():
+        root = Path(pie_root)
+    pie = PIE(data_path=str(root))
+    seq = pie.generate_data_trajectory_sequence(
+        split, fstride=1, sample_type=sample_type, seq_type="crossing",
+        min_track_size=obs_len + 60, height_rng=[0, float("inf")],
+        squarify_ratio=0, data_split_type="default")
+
+    pids = seq.get("pid") or seq.get("ped_id")
+    for i, tr_boxes in enumerate(seq["bbox"]):
+        pid_i = pids[i][0][0]
+        if ped_id is not None and pid_i != ped_id:
+            continue
+        frames = np.array([frame_number_from_path(p) for p in seq["image"][i]],
+                          dtype=np.int64)
+        boxes = np.asarray(tr_boxes, dtype=np.float32)
+        wins = list(iter_windows(len(boxes), obs_len=obs_len))
+        if not wins:
+            continue
+        label = int((seq.get("activities") or seq["intention_binary"])[i][0][0])
+        return pid_i, boxes, frames, wins, label
+    return None
 
 
 def main():
@@ -197,6 +238,10 @@ def main():
     ap.add_argument("--obs-len", type=int, default=16)
     ap.add_argument("--step", type=int, default=6)
     ap.add_argument("--out-dir", default="viz_out")
+    ap.add_argument("--pie-root", default=None,
+                    help="root PIE: usa le FINESTRE REALI del dataset "
+                         "(protocollo TTE [30,60]) invece di ritagliare la traccia")
+    ap.add_argument("--split", default="train", choices=["train", "val", "test"])
     ap.add_argument("--no-extra-joints", action="store_true")
     ap.add_argument("--norm-mode", default="bbox_topleft",
                     choices=["bbox_topleft", "bbox_topleft_scaled", "none"])
@@ -222,25 +267,58 @@ def main():
         print(f"ped-id non specificato/trovato -> uso {pid}")
 
     tr = tracks[pid]
-    kps = np.asarray(tr["keypoints"], dtype=np.float32)
-    bbs = np.asarray(tr["bbox"], dtype=np.float32)
-    frs = np.asarray(tr["frames"])
-    print(f"Pedone {pid}: {len(frs)} frame ({frs[0]}–{frs[-1]}), "
-          f"conf media {kps[:, :, 2].mean():.3f}")
+    kps_all = np.asarray(tr["keypoints"], dtype=np.float32)
+    pose_frames = np.asarray(tr["frames"])
 
-    starts = list(range(0, len(frs) - args.obs_len + 1, args.step))
-    picks = np.linspace(0, len(starts) - 1, args.n_windows).astype(int)
+    if args.pie_root:
+        # ── FINESTRE REALI del dataset ──
+        res = load_real_windows(args.pie_root, args.split, pid, args.obs_len)
+        if res is None:
+            raise SystemExit(
+                f"Pedone {pid} non trovato nello split '{args.split}' "
+                f"(o traccia troppo corta). Prova un altro --split/--ped-id.")
+        pid, bbs_track, frs_track, wins, label = res
+        print(f"Pedone {pid} [{args.split}] — label={'CROSSING' if label else 'NON-CROSSING'}")
+        print(f"  traccia PIE: {len(frs_track)} frame ({frs_track[0]}–{frs_track[-1]}), "
+              f"crossing point al frame {frs_track[-1]}")
+        print(f"  finestre REALI (TTE 30-60, overlap 0.6): {len(wins)}")
 
-    for k, si in enumerate(picks):
-        s = starts[si]
-        e = s + args.obs_len
-        out = out_dir / f"skeleton_{pid}_win{k:02d}_f{int(frs[s])}_grid.png"
+        # riallinea le pose ai frame della traccia PIE
+        pos = np.searchsorted(pose_frames, frs_track)
+        kps = np.zeros((len(frs_track), kps_all.shape[1], 3), dtype=np.float32)
+        n_miss = 0
+        for t, p in enumerate(pos):
+            if p < len(pose_frames) and pose_frames[p] == frs_track[t]:
+                kps[t] = kps_all[p]
+            else:
+                n_miss += 1
+        if n_miss:
+            print(f"  ATTENZIONE: {n_miss}/{len(frs_track)} frame senza posa (zero-fill)")
+        bbs, frs = bbs_track, frs_track
+        sel = np.linspace(0, len(wins) - 1, args.n_windows).astype(int)
+        chosen = [(wins[i][0], wins[i][1], wins[i][2]) for i in sel]
+    else:
+        # ── fallback: ritaglio della traccia pose (solo ispezione coordinate) ──
+        kps, bbs, frs = kps_all, np.asarray(tr["bbox"], dtype=np.float32), pose_frames
+        print(f"Pedone {pid}: {len(frs)} frame ({frs[0]}–{frs[-1]}), "
+              f"conf media {kps[:, :, 2].mean():.3f}")
+        print("  [!] finestre ritagliate dalla traccia (non quelle del dataset). "
+              "Usa --pie-root per le finestre REALI.")
+        st = list(range(0, len(frs) - args.obs_len + 1, args.step))
+        sel = np.linspace(0, len(st) - 1, args.n_windows).astype(int)
+        chosen = [(st[i], st[i] + args.obs_len, None) for i in sel]
+
+    for k, (s, e, tte) in enumerate(chosen):
+        tag = f"tte{tte}" if tte is not None else f"f{int(frs[s])}"
+        out = out_dir / f"skeleton_{pid}_win{k:02d}_{tag}_grid.png"
         visualize_window_grid(kps[s:e], bbs[s:e], frs[s:e], out,
                               norm_mode=args.norm_mode,
-                              add_extra=not args.no_extra_joints)
-        print(f"  finestra {k}: frame {int(frs[s])}–{int(frs[e-1])} -> {out}")
+                              add_extra=not args.no_extra_joints,
+                              tte=tte)
+        extra = f" (TTE={tte})" if tte is not None else ""
+        print(f"  finestra {k}: frame {int(frs[s])}–{int(frs[e-1])}{extra} -> {out}")
         if args.overlay:
-            out2 = out_dir / f"skeleton_{pid}_win{k:02d}_f{int(frs[s])}_overlay.png"
+            out2 = out_dir / f"skeleton_{pid}_win{k:02d}_{tag}_overlay.png"
             visualize_window(kps[s:e], bbs[s:e], frs[s:e], out2,
                              add_extra=not args.no_extra_joints)
             print(f"              overlay -> {out2}")
