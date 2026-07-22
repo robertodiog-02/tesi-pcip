@@ -39,38 +39,51 @@ CLASS_NAMES = ["Non-crossing", "Crossing"]
 
 
 def plot_metric_curves(history, out_dir):
-    """Un PNG per metrica: train vs val lungo le epoche."""
+    """Un PNG per metrica: Train vs Val vs Test lungo le epoche."""
     epochs = [h["epoch"] for h in history]
 
     for key, title in METRICS:
         train_key = f"train_{key}"
         val_key   = f"val_{key}"
-        if train_key not in history[0] or val_key not in history[0]:
+        test_key  = f"test_{key}"
+
+        has_train = train_key in history[0]
+        has_val   = val_key in history[0]
+        has_test  = test_key in history[0]
+
+        if not has_train:
             continue
 
-        train_vals = [h[train_key] for h in history]
-        val_vals   = [h[val_key]   for h in history]
-
         plt.figure(figsize=(8, 5))
-        plt.plot(epochs, train_vals, marker="o", markersize=3,
+        plt.plot(epochs, [h[train_key] for h in history], marker="o", markersize=3,
                  linewidth=1.8, label="Train")
-        plt.plot(epochs, val_vals, marker="s", markersize=3,
-                 linewidth=1.8, label="Validation")
 
-        # evidenzia il best (max, o min per la loss)
-        if key == "loss":
-            best_i = int(np.argmin(val_vals))
-        else:
-            best_i = int(np.argmax(val_vals))
-        plt.axvline(epochs[best_i], color="gray", linestyle="--",
-                    alpha=0.6, linewidth=1)
-        plt.scatter([epochs[best_i]], [val_vals[best_i]],
-                    color="red", zorder=5, s=40,
-                    label=f"Best val ({val_vals[best_i]:.3f} @ ep {epochs[best_i]})")
+        title_parts = ["Train"]
+
+        if has_val:
+            val_vals = [h[val_key] for h in history]
+            plt.plot(epochs, val_vals, marker="s", markersize=3,
+                     linewidth=1.8, label="Validation")
+            best_i = int(np.argmin(val_vals)) if key == "loss" else int(np.argmax(val_vals))
+            plt.axvline(epochs[best_i], color="gray", linestyle="--", alpha=0.5, linewidth=1)
+            plt.scatter([epochs[best_i]], [val_vals[best_i]], color="red", zorder=5, s=40,
+                        label=f"Best val ({val_vals[best_i]:.3f} @ ep {epochs[best_i]})")
+            title_parts.append("Validation")
+
+        if has_test:
+            test_vals = [h[test_key] for h in history]
+            plt.plot(epochs, test_vals, marker="^", markersize=3,
+                     linewidth=1.8, label="Test", color="green")
+            if not has_val:
+                best_i = int(np.argmin(test_vals)) if key == "loss" else int(np.argmax(test_vals))
+                plt.axvline(epochs[best_i], color="gray", linestyle="--", alpha=0.5, linewidth=1)
+                plt.scatter([epochs[best_i]], [test_vals[best_i]], color="darkgreen", zorder=5, s=40,
+                            label=f"Best test ({test_vals[best_i]:.3f} @ ep {epochs[best_i]})")
+            title_parts.append("Test")
 
         plt.xlabel("Epoch")
         plt.ylabel(title)
-        plt.title(f"{title} — Train vs Validation")
+        plt.title(f"{title} — {' vs '.join(title_parts)}")
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.tight_layout()

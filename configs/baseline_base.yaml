@@ -28,6 +28,7 @@ training:
   patience: 60
   scheduler: none
   use_validation: false
+  eval_test_every_epoch: true
 
 output:
   checkpoint_dir: checkpoints

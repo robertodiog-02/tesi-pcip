@@ -39,6 +39,8 @@ class BaselineGRU(nn.Module):
         use_bbox:       bool  = True,
         use_bbox_displacement: bool = False,
         use_bbox_delta: bool  = True,
+        use_pdm:        bool  = False,
+        use_polar:      bool  = False,
         use_ego_speed:  bool  = False,
     ):
         super().__init__()
