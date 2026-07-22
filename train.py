@@ -39,6 +39,7 @@ from sklearn.metrics import (
 )
 
 from data.pie_dataset import PIEDataset
+from data.val_split import load_or_create_split, split_samples, describe_split
 from models.models import BaselineGRU, TransformerModalityNet
 from models.models_benchmark import BenchmarkSingleRNN
 from plot_metrics import plot_metric_curves, plot_confusion_matrices
@@ -105,6 +106,44 @@ def _polar_dim(cfg: Dict) -> int:
 def _skeleton_joints(cfg: Dict) -> int:
     """N giunti coerente con la config dataset: 20 con i punti extra, 17 senza."""
     return 20 if cfg["data"].get("skeleton_add_extra_joints", True) else 17
+
+
+class _SampleView(torch.utils.data.Dataset):
+    """
+    Vista su un PIEDataset con un sottoinsieme dei sample.
+
+    Serve a dividere train/val senza rigenerare le sequenze PIE (operazione
+    lenta): il dataset si costruisce una volta sola e poi si creano due viste
+    che condividono lo stesso preprocessing.
+    """
+
+    def __init__(self, base: PIEDataset, samples):
+        self.base = base
+        self.samples = samples
+        # eredita le dimensioni delle feature, servono a build_model
+        for attr in ("pdm_dim", "polar_dim", "displacement_dim",
+                     "delta_dim", "skeleton_joints"):
+            if hasattr(base, attr):
+                setattr(self, attr, getattr(base, attr))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        # riusa __getitem__ del dataset base scambiando temporaneamente la lista
+        real, self.base.samples = self.base.samples, self.samples
+        try:
+            return self.base[idx]
+        finally:
+            self.base.samples = real
+
+    def get_class_weights(self):
+        labels = np.array([s["label"] for s in self.samples])
+        n_pos, n_neg, n = (labels == 1).sum(), (labels == 0).sum(), len(labels)
+        w_pos = n / (2.0 * n_pos) if n_pos > 0 else 1.0
+        w_neg = n / (2.0 * n_neg) if n_neg > 0 else 1.0
+        print(f"  Class weights — crossing: {w_pos:.3f}, non-crossing: {w_neg:.3f}")
+        return torch.tensor([w_neg, w_pos], dtype=torch.float32)
 
 
 def build_model(cfg: Dict) -> nn.Module:
@@ -329,23 +368,49 @@ def main():
         skeleton_add_extra_joints=data_cfg.get("skeleton_add_extra_joints", True),
     )
     
-    # modalita' "solo train per N epoche": disattiva il validation set
-    use_val = train_cfg.get("use_validation", True)
+    # ── Modalita' di validation ──────────────────────────────────────────
+    #   use_val_from_train: true  -> val = fetta stratificata del TRAIN
+    #                                (split per pedone, persistente su file)
+    #   altrimenti use_validation: true  -> val ufficiale PIE
+    #                             false -> nessun validation
+    use_val_from_train = train_cfg.get("use_val_from_train", False)
+    use_val = use_val_from_train or train_cfg.get("use_validation", True)
 
-    train_ds = PIEDataset(data_cfg["annotation_root"], split="train",
-                          obs_len=data_cfg["obs_len"],
-                          bbox_normalization=bbox_norm,
-                          speed_normalization=speed_norm,
-                          drop_first_frame=drop_ff,
-                          **_geom,
-                          sample_type=_st)
+    full_train_ds = PIEDataset(data_cfg["annotation_root"], split="train",
+                               obs_len=data_cfg["obs_len"],
+                               bbox_normalization=bbox_norm,
+                               speed_normalization=speed_norm,
+                               drop_first_frame=drop_ff,
+                               **_geom,
+                               sample_type=_st)
+
+    if use_val_from_train:
+        print("\n[INFO] use_val_from_train=True -> validation ritagliato dal train")
+        val_ids = load_or_create_split(
+            full_train_ds.samples,
+            path=train_cfg.get("val_split_file", "data/val_split.json"),
+            n_val=train_cfg.get("val_n_peds", 80),
+            seed=train_cfg.get("val_split_seed", 42),
+            stratified=train_cfg.get("val_stratified", True),
+        )
+        tr_samples, va_samples = split_samples(full_train_ds.samples, val_ids)
+        describe_split(tr_samples, va_samples)
+
+        train_ds = _SampleView(full_train_ds, tr_samples)
+        val_ds = _SampleView(full_train_ds, va_samples)
+    else:
+        train_ds = full_train_ds
+        val_ds = None
 
     train_loader = DataLoader(train_ds, batch_size=train_cfg["batch_size"],
                               shuffle=True, num_workers=0, collate_fn=collate_fn)
     train_eval_loader = DataLoader(train_ds, batch_size=train_cfg["batch_size"],
                                    shuffle=False, num_workers=0, collate_fn=collate_fn)
 
-    if use_val:
+    if use_val_from_train:
+        val_loader = DataLoader(val_ds, batch_size=train_cfg["batch_size"],
+                                shuffle=False, num_workers=0, collate_fn=collate_fn)
+    elif use_val:
         val_ds = PIEDataset(data_cfg["annotation_root"], split="val",
                             obs_len=data_cfg["obs_len"],
                             bbox_normalization=bbox_norm,
@@ -356,17 +421,10 @@ def main():
         val_loader = DataLoader(val_ds, batch_size=train_cfg["batch_size"],
                                 shuffle=False, num_workers=0, collate_fn=collate_fn)
     else:
-        # Quando use_validation è False, valutiamo a fine epoca sul TEST set
-        val_ds = PIEDataset(data_cfg["annotation_root"], split="test",
-                            obs_len=data_cfg["obs_len"],
-                            bbox_normalization=bbox_norm,
-                            speed_normalization=speed_norm,
-                            drop_first_frame=drop_ff,
-                            **_geom,
-                            sample_type=_st)
-        val_loader = DataLoader(val_ds, batch_size=train_cfg["batch_size"],
-                                shuffle=False, num_workers=0, collate_fn=collate_fn)
-        print("\n[INFO] use_validation=False -> valutazione a fine epoca sul TEST set (niente early stopping).")
+        val_ds = None
+        val_loader = None
+        print("\n[INFO] use_validation=False -> nessun validation set, "
+              "addestro per tutte le epoche sul solo train.")
 
     # -- Modello --------------------------------------------------------------
     model = build_model(cfg).to(device)
@@ -430,6 +488,9 @@ def main():
 
     # -- Resume ---------------------------------------------------------------
     start_epoch = 1
+    # etichetta del validation nelle stampe, per non confondere i due casi
+    _vlab = "VAL-T" if use_val_from_train else "VAL  "
+
     best_val_f1 = 0.0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
@@ -457,9 +518,7 @@ def main():
                                  optimizer=None,
                                  desc=f"Epoch {epoch}/{epochs} [val]  ")
         else:
-            val_m, _ = run_epoch(model, val_loader, criterion, device,
-                                 optimizer=None,
-                                 desc=f"Epoch {epoch}/{epochs} [test] ")
+            val_m = None
 
         if scheduler is not None:
             scheduler.step()
@@ -473,7 +532,7 @@ def main():
                 f"  TRAIN loss={train_m['loss']:.4f} acc={train_m['acc']:.4f} "
                 f"f1={train_m['f1']:.4f} auc={train_m['auc']:.4f} "
                 f"P={train_m['precision']:.4f} R={train_m['recall']:.4f}\n"
-                f"  VAL   loss={val_m['loss']:.4f} acc={val_m['acc']:.4f} "
+                f"  {_vlab} loss={val_m['loss']:.4f} acc={val_m['acc']:.4f} "
                 f"f1={val_m['f1']:.4f} auc={val_m['auc']:.4f} "
                 f"P={val_m['precision']:.4f} R={val_m['recall']:.4f}"
             )
@@ -482,42 +541,40 @@ def main():
                 f"Epoch {epoch:3d}/{epochs} ({elapsed:.0f}s) lr={lr_now:.2e}\n"
                 f"  TRAIN loss={train_m['loss']:.4f} acc={train_m['acc']:.4f} "
                 f"f1={train_m['f1']:.4f} auc={train_m['auc']:.4f} "
-                f"P={train_m['precision']:.4f} R={train_m['recall']:.4f}\n"
-                f"  TEST  loss={val_m['loss']:.4f} acc={val_m['acc']:.4f} "
-                f"f1={val_m['f1']:.4f} auc={val_m['auc']:.4f} "
-                f"P={val_m['precision']:.4f} R={val_m['recall']:.4f}"
+                f"P={train_m['precision']:.4f} R={train_m['recall']:.4f}"
             )
 
         row = {"epoch": epoch,
-               **{f"train_{k}": v for k, v in train_m.items()},
-               **{f"val_{k}": v for k, v in val_m.items()}}
+               **{f"train_{k}": v for k, v in train_m.items()}}
+        if use_val:
+            row.update({f"val_{k}": v for k, v in val_m.items()})
         history.append(row)
         with open(out_dir / "history.json", "w") as f:
             json.dump(history, f, indent=2)
 
-        # Salva il best_model se l'F1 del val_loader (val o test split) migliora
-        if val_m["f1"] > best_val_f1:
-            best_val_f1 = val_m["f1"]
-            patience_counter = 0
-            torch.save({"epoch": epoch, "model_state": model.state_dict(),
-                        "optimizer_state": optimizer.state_dict(),
-                        "val_metrics": val_m, "config": cfg},
-                       out_dir / "best_model.pt")
-            label_set = "val" if use_val else "test"
-            print(f"  ✓ Best model salvato ({label_set}_f1={best_val_f1:.4f})")
-        else:
-            if use_val:
+        if use_val:
+            # selezione best su val f1 + early stopping
+            if val_m["f1"] > best_val_f1:
+                best_val_f1 = val_m["f1"]
+                patience_counter = 0
+                torch.save({"epoch": epoch, "model_state": model.state_dict(),
+                            "optimizer_state": optimizer.state_dict(),
+                            "val_metrics": val_m, "config": cfg},
+                           out_dir / "best_model.pt")
+                print(f"  ✓ Best model salvato (val_f1={best_val_f1:.4f})")
+            else:
                 patience_counter += 1
                 if patience_counter >= train_cfg.get("patience", 10**9):
                     print(f"\nEarly stopping (patience={train_cfg['patience']})")
                     break
 
-    # Salva sempre il modello dell'ultima epoca come final_model.pt
-    torch.save({"epoch": epochs, "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "val_metrics": val_m, "config": cfg},
-               out_dir / "final_model.pt")
-    print("  Modello finale (ultima epoca) salvato come final_model.pt")
+    # In modalita' senza validation salviamo il modello finale come best_model
+    if not use_val:
+        torch.save({"epoch": epochs, "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "val_metrics": None, "config": cfg},
+                   out_dir / "best_model.pt")
+        print("  Modello finale (ultima epoca) salvato come best_model.pt")
 
     # -- Evaluation finale del best model ------------------------------------
     print("\n=== Evaluation finale (best model) ===")
@@ -536,7 +593,8 @@ def main():
 
     eval_splits = [("train", train_eval_loader)]
     if use_val:
-        eval_splits.append(("val", val_loader))
+        eval_splits.append(("val_from_train" if use_val_from_train else "val",
+                            val_loader))
     eval_splits.append(("test", test_loader))
 
     final_metrics = {}
