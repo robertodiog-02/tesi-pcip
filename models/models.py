@@ -39,32 +39,19 @@ class BaselineGRU(nn.Module):
         use_bbox:       bool  = True,
         use_bbox_displacement: bool = False,
         use_bbox_delta: bool  = True,
-        use_pdm:        bool  = False,
-        use_polar:      bool  = False,
         use_ego_speed:  bool  = False,
-        pdm_dim:        int   = 3,
-        polar_dim:      int   = 6,
-        displacement_dim: int = 4,
-        delta_dim:      int   = 4,
     ):
         super().__init__()
         self.use_bbox = use_bbox
-        self.use_bbox_displacement = use_bbox_displacement
-        self.use_bbox_delta = use_bbox_delta
         self.use_pdm = use_pdm
         self.use_polar = use_polar
+        self.use_bbox_displacement = use_bbox_displacement
+        self.use_bbox_delta = use_bbox_delta
         self.use_ego_speed  = use_ego_speed
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
 
-        input_dim = (
-            (4 if use_bbox else 0)
-            + (displacement_dim if use_bbox_displacement else 0)
-            + (delta_dim if use_bbox_delta else 0)
-            + (pdm_dim if use_pdm else 0)
-            + (polar_dim if use_polar else 0)
-            + (1 if use_ego_speed else 0)
-        )
+        input_dim = (4 if use_bbox else 0) + (4 if use_bbox_displacement else 0) + (4 if use_bbox_delta else 0) + (1 if use_ego_speed else 0)
         self.input_dim = input_dim
 
 
@@ -120,12 +107,27 @@ _COCO17_EDGES = [
     (5, 11), (6, 12), (11, 12),                # torso
     (11, 13), (13, 15), (12, 14), (14, 16),    # gambe
 ]
+# Collo derivato (idx 17) — usato sia in OpenPose-18 sia in GTransPDM-20.
+# Archi come nella topologia OpenPose: collo <-> naso e collo <-> spalle.
+_NECK_EDGES = [(17, 0), (17, 5), (17, 6)]
+
 # Punti extra GTransPDM (17=neck, 18=hip, 19=body center) e i loro archi
-_EXTRA_EDGES = [
-    (17, 0), (17, 5), (17, 6),      # neck: naso e spalle
+_EXTRA_EDGES = _NECK_EDGES + [
     (18, 11), (18, 12),             # hip: anche
     (19, 17), (19, 18),             # body center: neck e hip
 ]
+
+
+def _edges_for(n_joints: int):
+    """Archi dello scheletro secondo il numero di giunti."""
+    e = list(_COCO17_EDGES)
+    if n_joints == 18:
+        e += _NECK_EDGES            # COCO-17 + collo (topologia OpenPose-18)
+    elif n_joints == 20:
+        e += _EXTRA_EDGES           # + hip e body center (GTransPDM)
+    elif n_joints != 17:
+        raise ValueError(f"n_joints non supportato: {n_joints} (17, 18 o 20)")
+    return e
 
 
 def _build_adjacency(n_joints: int) -> torch.Tensor:
@@ -134,10 +136,7 @@ def _build_adjacency(n_joints: int) -> torch.Tensor:
     Adiacenza anatomica + self-connections, normalizzazione simmetrica.
     """
     A = torch.zeros(n_joints, n_joints)
-    edges = list(_COCO17_EDGES)
-    if n_joints == 20:
-        edges += _EXTRA_EDGES
-    for i, j in edges:
+    for i, j in _edges_for(n_joints):
         A[i, j] = 1.0
         A[j, i] = 1.0
     A = A + torch.eye(n_joints)
@@ -274,6 +273,230 @@ def _build_head(in_dim: int, out_dim: int, n_layers: int,
     return nn.Sequential(*layers)
 
 
+
+
+# ─── Pose-STGAT (Dual-STGAT, Lian et al. 2025) ───────────────────────────────
+
+def _build_partitioned_adjacency(n_joints: int,
+                                 ref_joints=(11, 12)) -> torch.Tensor:
+    """
+    Partizionamento a configurazione spaziale (STGCN / Dual-STGAT eq. 19).
+
+    L'adiacenza viene divisa in TRE matrici invece di una sola:
+        A_0 : il nodo radice stesso (self-loop)
+        A_1 : gruppo CENTRIPETO  — vicini piu' VICINI al baricentro
+        A_2 : gruppo CENTRIFUGO  — vicini piu' LONTANI dal baricentro
+
+    L'idea: un movimento verso il centro del corpo e uno verso l'esterno
+    hanno significato diverso, quindi meritano pesi diversi. Con l'adiacenza
+    unica di GTransPDM questa distinzione si perde.
+
+    Il baricentro e' la media delle coordinate dei giunti; qui lo
+    approssimiamo topologicamente con la distanza sul grafo dai giunti di
+    riferimento (le anche), che e' stabile e non dipende dai dati.
+
+    Returns: [3, N, N] gia' normalizzate D^-1/2 A D^-1/2
+    """
+    import collections
+
+    # adiacenza binaria
+    adj = torch.zeros(n_joints, n_joints)
+    for i, j in _edges_for(n_joints):
+        adj[i, j] = 1.0
+        adj[j, i] = 1.0
+
+    # distanza sul grafo dal baricentro (BFS dai giunti di riferimento)
+    INF = 10 ** 6
+    dist = [INF] * n_joints
+    q = collections.deque()
+    for r in ref_joints:
+        if r < n_joints:
+            dist[r] = 0
+            q.append(r)
+    while q:
+        u = q.popleft()
+        for v in range(n_joints):
+            if adj[u, v] > 0 and dist[v] == INF:
+                dist[v] = dist[u] + 1
+                q.append(v)
+
+    A = torch.zeros(3, n_joints, n_joints)
+    for i in range(n_joints):
+        A[0, i, i] = 1.0                       # A_0: root
+        for j in range(n_joints):
+            if adj[i, j] > 0:
+                if dist[j] < dist[i]:
+                    A[1, i, j] = 1.0           # A_1: centripeto
+                else:
+                    A[2, i, j] = 1.0           # A_2: centrifugo
+
+    # normalizzazione simmetrica di ciascuna partizione
+    for k in range(3):
+        deg = A[k].sum(-1)
+        d = deg.pow(-0.5)
+        d[torch.isinf(d)] = 0.0
+        D = torch.diag(d)
+        A[k] = D @ A[k] @ D
+    return A
+
+
+class VelocityAttention(nn.Module):
+    """
+    Velocity Attention di Dual-STGAT (sez. III-D.3), stile Squeeze-and-Excitation.
+
+    La velocita' dell'ego-veicolo NON entra come ramo separato ma modula
+    channel-wise le feature della posa:
+        squeeze   : global average pooling sull'output del GCN -> [B, C]
+        excite    : la velocita' viene proiettata a C canali
+        sigmoid   : pesi in [0, 1]
+        weighting : F <- F * w
+
+    Concettualmente: quanto conta un certo canale della posa dipende da
+    quanto va veloce il veicolo. Un movimento del busto significa una cosa
+    diversa se il veicolo e' fermo o lanciato.
+    """
+
+    def __init__(self, channels: int, speed_dim: int = 1, reduction: int = 4):
+        super().__init__()
+        hidden = max(4, channels // reduction)
+        self.fc = nn.Sequential(
+            nn.Linear(channels + speed_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, channels),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor,
+                speed: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """x: [B, T, N, C], speed: [B, T, 1] -> [B, T, N, C]"""
+        ctx = x.mean(dim=2)                                # squeeze: [B, T, C]
+        if speed is not None:
+            ctx = torch.cat([ctx, speed], dim=-1)
+        else:
+            ctx = torch.cat([ctx, torch.zeros_like(ctx[..., :1])], dim=-1)
+        w = self.fc(ctx).unsqueeze(2)                      # [B, T, 1, C]
+        return x * w
+
+
+class STGATLayer(nn.Module):
+    """
+    Un layer STGAT: GCN partizionato -> Velocity Attention -> TCN.
+    (Dual-STGAT, Fig. 4)
+    """
+
+    def __init__(self, in_ch: int, out_ch: int, adj: torch.Tensor,
+                 speed_dim: int = 1, kt: int = 9, dropout: float = 0.0,
+                 use_velocity: bool = True, residual: bool = True):
+        super().__init__()
+        self.register_buffer("adj", adj)                   # [3, N, N]
+        self.n_part = adj.shape[0]
+
+        # una matrice di pesi per ciascuna partizione (eq. 20)
+        self.weights = nn.ModuleList(
+            [nn.Linear(in_ch, out_ch, bias=False) for _ in range(self.n_part)])
+        self.edge_importance = nn.Parameter(torch.ones_like(adj))
+        self.bn_gcn = nn.BatchNorm2d(out_ch)
+
+        self.vel_attn = (VelocityAttention(out_ch, speed_dim)
+                         if use_velocity else None)
+
+        # TCN: conv 1D lungo il tempo, kernel kt x 1
+        pad = ((kt - 1) // 2, 0)
+        self.tcn = nn.Sequential(
+            nn.Conv2d(out_ch, out_ch, kernel_size=(kt, 1), padding=pad),
+            nn.BatchNorm2d(out_ch),
+            nn.Dropout(dropout),
+        )
+
+        if not residual:
+            self.residual = None
+        elif in_ch == out_ch:
+            self.residual = nn.Identity()
+        else:
+            self.residual = nn.Conv2d(in_ch, out_ch, kernel_size=1)
+        self.relu = nn.ReLU()
+
+    def forward(self, x: torch.Tensor,
+                speed: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """x: [B, T, N, C_in] -> [B, T, N, C_out]"""
+        res = 0.0
+        if self.residual is not None:
+            res = (x if isinstance(self.residual, nn.Identity)
+                   else self.residual(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1))
+
+        # GCN partizionato: somma sui 3 gruppi, pesi distinti (eq. 20)
+        adj = self.adj * self.edge_importance
+        out = 0.0
+        for k in range(self.n_part):
+            out = out + self.weights[k](torch.matmul(adj[k], x))
+        out = self.bn_gcn(out.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        out = self.relu(out)
+
+        # Velocity Attention (channel-wise)
+        if self.vel_attn is not None:
+            out = self.vel_attn(out, speed)
+
+        # TCN lungo il tempo
+        out = self.tcn(out.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        return self.relu(out + res)
+
+
+class PoseSTGAT(nn.Module):
+    """
+    Pose-STGAT di Dual-STGAT (Lian et al., TITS 2025).
+
+    Differenze rispetto allo Skeleton Pose Encoder di GTransPDM:
+
+      1. ADIACENZA PARTIZIONATA in 3 gruppi (root / centripeto / centrifugo)
+         con pesi distinti, invece di un'unica adiacenza.
+      2. VELOCITY ATTENTION: la velocita' dell'ego-veicolo modula channel-wise
+         le feature della posa DENTRO l'encoder, invece di restare un ramo
+         separato che si fonde dopo.
+      3. TCN esplicito lungo il tempo (kernel kt x 1) invece del solo residuo
+         Conv2D.
+
+    Il paper usa 3 layer con canali 32, 64, 64 (Tabella IV: P=3 e' l'ottimo).
+    """
+
+    def __init__(
+        self,
+        n_joints: int = 20,
+        in_channels: int = 3,
+        out_dim: int = 64,
+        channels=(32, 64, 64),
+        kt: int = 9,
+        speed_dim: int = 1,
+        dropout: float = 0.0,
+        use_velocity: bool = True,
+    ):
+        super().__init__()
+        self.n_joints = n_joints
+        self.use_velocity = use_velocity
+        adj = _build_partitioned_adjacency(n_joints)
+
+        self.input_bn = nn.BatchNorm1d(in_channels * n_joints)
+        dims = [in_channels] + list(channels)
+        self.layers = nn.ModuleList([
+            STGATLayer(dims[i], dims[i + 1], adj, speed_dim=speed_dim, kt=kt,
+                       dropout=dropout, use_velocity=use_velocity,
+                       residual=(i > 0))
+            for i in range(len(channels))
+        ])
+        self.fc_out = nn.Linear(n_joints * channels[-1], out_dim)
+
+    def forward(self, keypoints: torch.Tensor,
+                speed: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """keypoints: [B,T,N,3], speed: [B,T,1] -> [B, T, out_dim]"""
+        B, T, N, C = keypoints.shape
+        x = keypoints.reshape(B, T, N * C).transpose(1, 2)
+        x = self.input_bn(x).transpose(1, 2).reshape(B, T, N, C)
+
+        for layer in self.layers:
+            x = layer(x, speed)
+
+        return self.fc_out(x.reshape(B, T, -1))
+
+
 class TransformerModalityNet(nn.Module):
     """
     Transformer Modality Network.
@@ -343,11 +566,23 @@ class TransformerModalityNet(nn.Module):
     `use_bbox_displacement`, `use_bbox_delta` e `use_ego_speed` sono
     indipendenti e restano attivabili con qualunque combinazione.
 
-    SKELETON — `use_skeleton` attiva lo Skeleton Pose Encoder di GTransPDM
-    (eq. 6-7): 4 blocchi GCN con edge importance apprendibile e residui
-    Conv2D, flatten sui giunti, FC -> X_ke [B,T,C_d]. Con la fusione
-    gerarchica X_ke e' il terzo ramo dell'eq. 8: X = FC(Concat[X_pe, X_ev,
-    X_ke]); con la fusione piatta viene concatenato alle altre proiezioni.
+    SKELETON — `use_skeleton` attiva il ramo posa; `skeleton_encoder` sceglie
+    quale architettura usare:
+
+      "gtranspdm" (GTransPDM eq. 6-7): 4 blocchi GCN con adiacenza anatomica
+          unica, edge importance apprendibile e residui Conv2D.
+
+      "stgat" (Dual-STGAT, Lian et al. 2025): adiacenza PARTIZIONATA in tre
+          gruppi (root / centripeto / centrifugo) con pesi distinti, VELOCITY
+          ATTENTION che fa modulare le feature della posa dalla velocita'
+          dell'ego-veicolo channel-wise, e TCN esplicito lungo il tempo.
+          Nota: con questo encoder la velocita' entra DUE volte — dentro la
+          posa e come ramo suo — il che e' voluto: nel paper originale la
+          velocita' non ha un ramo separato, qui puoi averli entrambi o
+          disattivare use_ego_speed per restare fedele a Dual-STGAT.
+
+    In entrambi i casi l'output e' X_ke [B,T,C_d] e con la fusione gerarchica
+    e' il terzo ramo dell'eq. 8: X = FC(Concat[X_pe, X_ev, X_ke]).
 
     STABILITA' — due opzioni indipendenti, entrambe disattivate di default:
 
@@ -390,9 +625,13 @@ class TransformerModalityNet(nn.Module):
         use_bbox_delta: bool  = False,
         use_ego_speed:  bool  = True,
         use_skeleton:   bool  = False,
+        skeleton_encoder: str = "gtranspdm",   # "gtranspdm" | "stgat"
         skeleton_n_joints: int = 20,       # 20 = 17 COCO + neck/hip/center (GTransPDM)
-        skeleton_hidden: int  = 64,        # d_hid
-        skeleton_layers: int  = 4,
+        skeleton_hidden: int  = 64,        # d_hid (solo gtranspdm)
+        skeleton_layers: int  = 4,         # n. blocchi (solo gtranspdm)
+        stgat_channels        = (32, 64, 64),  # canali dei layer STGAT (paper: 3 layer)
+        stgat_kt:       int   = 9,         # kernel temporale del TCN
+        stgat_velocity: bool  = True,      # velocity attention (SE con ego-speed)
     ):
         super().__init__()
         assert pooling in ("cls", "last", "mean", "flatten", "attention"), \
@@ -440,16 +679,35 @@ class TransformerModalityNet(nn.Module):
         if use_ego_speed:
             self.projections["speed"] = nn.Linear(1, hidden_dim)
 
-        # Skeleton Pose Encoder (GTransPDM eq. 6-7): ramo a parte, il suo
-        # output X_ke [B,T,C_d] entra nella fusione come una modalita'.
-        self.skeleton_encoder = (
-            SkeletonEncoder(
+        # Skeleton Pose Encoder: ramo a parte, il suo output X_ke [B,T,C_d]
+        # entra nella fusione come una modalita'.
+        #   "gtranspdm" -> GCN residui + edge importance (GTransPDM eq. 6-7)
+        #   "stgat"     -> Pose-STGAT (Dual-STGAT): adiacenza partizionata in
+        #                  3 gruppi, velocity attention, TCN
+        assert skeleton_encoder in ("gtranspdm", "stgat"), \
+            f"skeleton_encoder non valido: {skeleton_encoder}"
+        self.skeleton_encoder_type = skeleton_encoder
+        self.skeleton_uses_speed = (use_skeleton and skeleton_encoder == "stgat"
+                                    and stgat_velocity)
+
+        if not use_skeleton:
+            self.skeleton_encoder = None
+        elif skeleton_encoder == "stgat":
+            self.skeleton_encoder = PoseSTGAT(
+                n_joints=skeleton_n_joints,
+                out_dim=hidden_dim,
+                channels=tuple(stgat_channels),
+                kt=stgat_kt,
+                dropout=dropout,
+                use_velocity=stgat_velocity,
+            )
+        else:
+            self.skeleton_encoder = SkeletonEncoder(
                 n_joints=skeleton_n_joints,
                 hidden_channels=skeleton_hidden,
                 out_dim=hidden_dim,
                 n_layers=skeleton_layers,
-            ) if use_skeleton else None
-        )
+            )
 
         n_modalities = len(self.projections) + int(use_skeleton)
         assert n_modalities > 0, (
@@ -522,6 +780,12 @@ class TransformerModalityNet(nn.Module):
         self.decoder = _build_head(
             head_in, 1, head_layers, head_hidden or hidden_dim, head_dropout)
 
+    def _encode_skeleton(self, keypoints, ego_speed):
+        """Applica l'encoder posa; STGAT riceve anche la velocita'."""
+        if self.skeleton_encoder_type == "stgat":
+            return self.skeleton_encoder(keypoints, ego_speed)
+        return self.skeleton_encoder(keypoints)
+
     def forward(
         self,
         bbox:              torch.Tensor,
@@ -562,9 +826,11 @@ class TransformerModalityNet(nn.Module):
                     x_ev = self.proj_ego(x_ev)
                 branches.append(x_ev)                       # [B, T, d_model]
 
-            # ── Livello 1c: ramo skeleton (X_ke, eq. 6-7) ──
+            # ── Livello 1c: ramo skeleton (X_ke) ──
+            # Con STGAT la velocita' entra DENTRO l'encoder (velocity
+            # attention), non solo come ramo separato.
             if self.use_skeleton:
-                branches.append(self.skeleton_encoder(keypoints))  # [B, T, d_model]
+                branches.append(self._encode_skeleton(keypoints, ego_speed))
 
             # ── Livello 2: fusione tra encoder (eq. 8) ──
             x = self.proj_fusion(torch.cat(branches, dim=-1))  # [B, T, d_model]
@@ -585,7 +851,7 @@ class TransformerModalityNet(nn.Module):
                 proj_feats.append(self.projections["speed"](ego_speed))
 
             if self.use_skeleton:
-                proj_feats.append(self.skeleton_encoder(keypoints))
+                proj_feats.append(self._encode_skeleton(keypoints, ego_speed))
 
             x = torch.cat(proj_feats, dim=-1)   # [B, T, n_modalities * d_model]
             x = self.proj_joint(x)              # [B, T, d_model]

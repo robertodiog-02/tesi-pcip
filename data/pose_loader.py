@@ -164,22 +164,143 @@ def normalize_keypoints(
     return out
 
 
-def add_extra_joints(keypoints: np.ndarray) -> np.ndarray:
+def add_extra_joints(keypoints: np.ndarray, mode: str = "gtranspdm") -> np.ndarray:
     """
-    Aggiunge i 3 punti extra di GTransPDM come media dei punti adiacenti:
+    Aggiunge giunti derivati come media dei punti adiacenti.
+
+    mode="gtranspdm" — 3 punti extra (GTransPDM), [T,17,3] -> [T,20,3]:
         17: neck        = media delle spalle (5, 6)
         18: hip         = media delle anche (11, 12)
         19: body center = media di neck e hip
 
-    La confidence dei punti extra e' la media delle confidence dei genitori.
-    [T, 17, 3] -> [T, 20, 3]
+    mode="openpose18" — solo il collo (Dual-STGAT), [T,17,3] -> [T,18,3]:
+        17: neck = media delle spalle (5, 6)
+
+        Dual-STGAT usa 18 keypoint OpenPose, che includono il collo come
+        giunto RILEVATO dalla rete. HigherHRNet produce COCO-17, che il collo
+        non ce l'ha. Lo deriviamo come media delle spalle — stesso metodo che
+        GTransPDM usa per i suoi punti extra. La posizione anatomica e gli
+        archi coincidono con quelli di OpenPose; la differenza e' che qui il
+        collo e' stimato, non osservato.
+
+    mode="none" — nessuna aggiunta, [T,17,3] invariato.
+
+    La confidence dei punti derivati e' la media di quella dei genitori.
     """
+    if mode == "none":
+        return keypoints
+
     neck = (keypoints[:, L_SHOULDER] + keypoints[:, R_SHOULDER]) / 2.0
-    hip = (keypoints[:, L_HIP] + keypoints[:, R_HIP]) / 2.0
-    center = (neck + hip) / 2.0
-    extra = np.stack([neck, hip, center], axis=1)          # [T, 3, 3]
-    return np.concatenate([keypoints, extra], axis=1)      # [T, 20, 3]
+
+    if mode == "openpose18":
+        return np.concatenate([keypoints, neck[:, None, :]], axis=1)   # [T,18,3]
+
+    if mode == "gtranspdm":
+        hip = (keypoints[:, L_HIP] + keypoints[:, R_HIP]) / 2.0
+        center = (neck + hip) / 2.0
+        extra = np.stack([neck, hip, center], axis=1)                  # [T,3,3]
+        return np.concatenate([keypoints, extra], axis=1)              # [T,20,3]
+
+    raise ValueError(f"mode sconosciuto: {mode}")
 
 
-def skeleton_n_joints(add_extra: bool = True) -> int:
-    return 20 if add_extra else 17
+def skeleton_n_joints(mode="gtranspdm") -> int:
+    """
+    Numero di giunti secondo la modalita'.
+    Accetta anche il vecchio booleano per retrocompatibilita'.
+    """
+    if isinstance(mode, bool):
+        mode = "gtranspdm" if mode else "none"
+    return {"none": 17, "openpose18": 18, "gtranspdm": 20}[mode]
+
+# ─── Preprocessing delle occlusioni (Dual-STGAT, sez. III-D.1) ───────────────
+
+def interpolate_occlusions(
+    keypoints: np.ndarray,
+    max_gap: int = 2,
+    interp_confidence: float = 0.5,
+    conf_threshold: float = 0.0,
+) -> Tuple[np.ndarray, dict]:
+    """
+    Gestione delle occlusioni come in Dual-STGAT:
+      - occlusioni BREVI (buco <= max_gap frame): interpolazione lineare tra
+        i frame validi prima e dopo
+      - occlusioni PROLUNGATE (buco > max_gap): coordinate azzerate a (0, 0)
+
+    L'interpolazione e' PER GIUNTO, non per frame intero: il detector puo'
+    rilevare 15 giunti su 17 in un frame, quindi il buco riguarda il singolo
+    keypoint. Questo copre anche il caso del frame completamente mancante.
+
+    Un buco di 1-2 frame azzerato produce un salto a zero e ritorno, che e'
+    un segnale spurio ben peggiore di una posizione stimata: per questo
+    interpolare i buchi brevi aiuta.
+
+    Args:
+        keypoints: [T, N, 3] (x, y, confidence)
+        max_gap: lunghezza massima del buco da interpolare
+        interp_confidence: confidence assegnata ai punti interpolati.
+            Il paper non lo specifica; un valore basso segnala al modello che
+            il giunto e' stimato e non osservato.
+        conf_threshold: un giunto e' considerato mancante se la confidence e'
+            <= a questa soglia (oltre al caso coordinate esattamente (0,0))
+
+    Returns:
+        (keypoints processati [T, N, 3], statistiche)
+    """
+    kp = keypoints.copy()
+    T, N, _ = kp.shape
+
+    # Criterio di "mancante": la CONFIDENCE e' il segnale primario.
+    # Le coordinate (0,0) contano solo se anche la confidence e' nulla —
+    # un keypoint legittimamente sul bordo dell'immagine puo' avere x=0 con
+    # confidence alta, e non va scambiato per mancante.
+    zero_xy = (kp[:, :, 0] == 0) & (kp[:, :, 1] == 0)
+    missing = (kp[:, :, 2] <= conf_threshold) | (zero_xy & (kp[:, :, 2] == 0))
+
+    n_interp = n_zeroed = 0
+
+    for j in range(N):
+        miss_j = missing[:, j]
+        if not miss_j.any():
+            continue
+
+        t = 0
+        while t < T:
+            if not miss_j[t]:
+                t += 1
+                continue
+
+            # estensione del buco corrente
+            start = t
+            while t < T and miss_j[t]:
+                t += 1
+            end = t - 1                      # ultimo frame mancante
+            gap_len = end - start + 1
+
+            has_before = start > 0
+            has_after = end < T - 1
+
+            if gap_len <= max_gap and has_before and has_after:
+                # ── occlusione BREVE: interpolazione lineare ──
+                p0 = kp[start - 1, j, :2]
+                p1 = kp[end + 1, j, :2]
+                for k in range(gap_len):
+                    a = (k + 1) / (gap_len + 1)
+                    kp[start + k, j, :2] = (1 - a) * p0 + a * p1
+                    kp[start + k, j, 2] = interp_confidence
+                n_interp += gap_len
+            else:
+                # ── occlusione PROLUNGATA (o ai bordi): azzeramento ──
+                kp[start:end + 1, j, :2] = 0.0
+                kp[start:end + 1, j, 2] = 0.0
+                n_zeroed += gap_len
+
+    stats = {
+        "n_missing": int(missing.sum()),
+        "n_interpolated": n_interp,
+        "n_zeroed": n_zeroed,
+        "total": T * N,
+    }
+    return kp, stats
+
+

@@ -36,15 +36,19 @@ from torch.utils.data import Dataset
 try:
     from .geometry import (compute_pdm, compute_tripolar, pdm_dim, tripolar_dim,
                            bbox_track_feature, track_feature_dim)
+    from .windowing import iter_windows, window_step
     from .pose_loader import (load_pose_index, extract_window_poses,
                               normalize_keypoints, add_extra_joints,
-                              frame_number_from_path, skeleton_n_joints)
+                              frame_number_from_path, skeleton_n_joints,
+                              interpolate_occlusions)
 except ImportError:
     from geometry import (compute_pdm, compute_tripolar, pdm_dim, tripolar_dim,
                           bbox_track_feature, track_feature_dim)
+    from windowing import iter_windows, window_step
     from pose_loader import (load_pose_index, extract_window_poses,
                              normalize_keypoints, add_extra_joints,
-                             frame_number_from_path, skeleton_n_joints)
+                             frame_number_from_path, skeleton_n_joints,
+                             interpolate_occlusions)
 
 OBS_LEN = 16
 TTE_MIN = 30   # frame (~1s)
@@ -101,7 +105,11 @@ def build_samples(
     use_skeleton:        bool = False,
     pose_index:          Dict = None,       # da load_pose_index (richiesto se use_skeleton)
     skeleton_norm:       str  = "bbox_topleft",
-    skeleton_add_extra_joints: bool = True,
+    skeleton_joints_mode: str = "gtranspdm",   # none|openpose18|gtranspdm
+    pose_interpolate:    bool = False,
+    pose_max_gap:        int  = 2,
+    pose_interp_confidence: float = 0.5,
+    pose_conf_threshold: float = 0.0,
 ) -> List[Dict]:
     """
     Costruisce i sample seguendo il protocollo temporale Kotseruba WACV 2021.
@@ -138,9 +146,15 @@ def build_samples(
         assert images_all is not None, (
             "use_skeleton richiede i path immagine nelle sequenze PIE "
             "(chiave 'image') per l'allineamento dei frame")
-        _n_j = skeleton_n_joints(skeleton_add_extra_joints)
+        _n_j = skeleton_n_joints(skeleton_joints_mode)
+        _desc = {"none": "17 COCO puri",
+                 "openpose18": "17 COCO + collo derivato (topologia OpenPose-18)",
+                 "gtranspdm": "17 COCO + collo/anca/centro derivati (GTransPDM)"}
         print(f"  >>> Skeleton: norm={skeleton_norm}, joints={_n_j} "
-              f"(extra={skeleton_add_extra_joints})")
+              f"-> {_desc[skeleton_joints_mode]}")
+        if pose_interpolate:
+            print(f"  >>> Occlusioni: buchi <= {pose_max_gap} frame interpolati "
+                  f"(conf={pose_interp_confidence}), oltre -> (0,0)")
 
     # Y_min per le linee di riferimento del PDM: minimo y su TUTTI i campioni
     # del dataset (GTransPDM: "Ymin is the minimum yt of all samples").
@@ -150,25 +164,18 @@ def build_samples(
         y_min = float(np.min(_ys)) if _ys else 0.0
         print(f"  >>> PDM Y_min calcolato dal dataset: {y_min:.1f}")
 
-    step = max(1, round(obs_len * (1.0 - overlap)))
+    step = window_step(obs_len, overlap)
     eff_len = obs_len - 1 if drop_first_frame else obs_len
 
     samples = []
     _miss_total = [0, 0]   # [frame senza posa, frame totali]
+    _occ_total = [0, 0, 0]  # [giunti interpolati, azzerati, totali]
 
     for i in range(len(bboxes_all)):
         track_bboxes = bboxes_all[i]
         T      = len(track_bboxes)
         label  = int(intbin_all[i][0][0])
         ped_id = pids_all[i][0][0] if pids_all[i] else f"ped_{i}"
-
-        if T < obs_len + tte_min:
-            continue
-
-        start_idx = max(0, T - obs_len - tte_max)
-        end_idx   = T - obs_len - tte_min
-        if end_idx < 0 or end_idx < start_idx:
-            continue
 
         obd_track = obd_all[i] if obd_all is not None else None
         gps_track = gps_all[i] if gps_all is not None else None
@@ -179,8 +186,11 @@ def build_samples(
                 [frame_number_from_path(im) for im in images_all[i]],
                 dtype=np.int64)
 
-        for w_start in range(start_idx, end_idx + 1, step):
-            w_end = w_start + obs_len
+        # Finestre dal protocollo condiviso (windowing.py): unica fonte di
+        # verita', usata anche da viz_skeleton e dall'estrattore di feature.
+        for w_start, w_end, _tte in iter_windows(
+                T, obs_len=obs_len, overlap=overlap,
+                tte_min=tte_min, tte_max=tte_max):
 
             obs_bboxes = np.array(track_bboxes[w_start:w_end], dtype=np.float32)
             if len(obs_bboxes) < obs_len:
@@ -237,9 +247,18 @@ def build_samples(
                 win_frames = track_frames[w_start:w_end]
                 kp_raw, n_miss = extract_window_poses(
                     pose_index, ped_id, win_frames)
+                # Preprocessing delle occlusioni PRIMA della normalizzazione:
+                # l'interpolazione va fatta sulle coordinate pixel originali.
+                if pose_interpolate:
+                    kp_raw, _ost = interpolate_occlusions(
+                        kp_raw, max_gap=pose_max_gap,
+                        interp_confidence=pose_interp_confidence,
+                        conf_threshold=pose_conf_threshold)
+                    _occ_total[0] += _ost["n_interpolated"]
+                    _occ_total[1] += _ost["n_zeroed"]
+                    _occ_total[2] += _ost["total"]
                 kp_norm = normalize_keypoints(kp_raw, obs_bboxes, skeleton_norm)
-                if skeleton_add_extra_joints:
-                    kp_norm = add_extra_joints(kp_norm)
+                kp_norm = add_extra_joints(kp_norm, skeleton_joints_mode)
                 kp_feat = kp_norm[1:] if drop_first_frame else kp_norm
                 _miss_total[0] += n_miss
                 _miss_total[1] += len(win_frames)
@@ -299,6 +318,11 @@ def build_samples(
         pct = 100.0 * _miss_total[0] / _miss_total[1]
         print(f"  skeleton: {_miss_total[0]}/{_miss_total[1]} frame senza posa "
               f"({pct:.1f}%) -> zero-fill")
+    if pose_interpolate and _occ_total[2] > 0:
+        pi = 100.0 * _occ_total[0] / _occ_total[2]
+        pz = 100.0 * _occ_total[1] / _occ_total[2]
+        print(f"  occlusioni: {_occ_total[0]} giunti interpolati ({pi:.2f}%), "
+              f"{_occ_total[1]} azzerati ({pz:.2f}%) su {_occ_total[2]} totali")
     return samples
 
 
@@ -326,7 +350,11 @@ class PIEDataset(Dataset):
         use_skeleton:        bool = False,
         pose_dir:            str  = "data/poses",
         skeleton_norm:       str  = "bbox_topleft",
-        skeleton_add_extra_joints: bool = True,
+        skeleton_joints_mode: str = "gtranspdm",
+        pose_interpolate:    bool = False,
+        pose_max_gap:        int  = 2,
+        pose_interp_confidence: float = 0.5,
+        pose_conf_threshold: float = 0.0,
         sample_type:    str = "all",
     ):
         assert split in ("train", "val", "test")
@@ -373,7 +401,11 @@ class PIEDataset(Dataset):
             use_skeleton=use_skeleton,
             pose_index=pose_index,
             skeleton_norm=skeleton_norm,
-            skeleton_add_extra_joints=skeleton_add_extra_joints,
+            skeleton_joints_mode=skeleton_joints_mode,
+            pose_interpolate=pose_interpolate,
+            pose_max_gap=pose_max_gap,
+            pose_interp_confidence=pose_interp_confidence,
+            pose_conf_threshold=pose_conf_threshold,
         )
 
         # dimensioni effettive delle feature (servono a costruire il modello)
@@ -383,7 +415,7 @@ class PIEDataset(Dataset):
                           if use_polar else 0)
         self.displacement_dim = track_feature_dim(displacement_type)
         self.delta_dim = track_feature_dim(delta_type)
-        self.skeleton_joints = (skeleton_n_joints(skeleton_add_extra_joints)
+        self.skeleton_joints = (skeleton_n_joints(skeleton_joints_mode)
                                 if use_skeleton else 0)
 
     def __len__(self):

@@ -103,9 +103,28 @@ def _polar_dim(cfg: Dict) -> int:
     return d * 2 if cfg["data"].get("polar_add_deltas", False) else d
 
 
+_JOINTS_N = {"none": 17, "openpose18": 18, "gtranspdm": 20}
+
+
+def _joints_mode(cfg: Dict) -> str:
+    """
+    Modalita' dei giunti. Se non specificata, il default segue l'encoder:
+      stgat     -> openpose18 (18 kp: 17 COCO + collo, topologia Dual-STGAT)
+      gtranspdm -> gtranspdm  (20 kp: + anca e centro corpo)
+    Impostandola esplicitamente si puo' confrontare i due encoder a PARITA'
+    di input, che per un'ablation pulita e' preferibile.
+    """
+    m = cfg["data"].get("skeleton_joints_mode")
+    if m is not None:
+        assert m in _JOINTS_N, f"skeleton_joints_mode non valido: {m}"
+        return m
+    enc = cfg["model"].get("skeleton_encoder", "gtranspdm")
+    return "openpose18" if enc == "stgat" else "gtranspdm"
+
+
 def _skeleton_joints(cfg: Dict) -> int:
-    """N giunti coerente con la config dataset: 20 con i punti extra, 17 senza."""
-    return 20 if cfg["data"].get("skeleton_add_extra_joints", True) else 17
+    """Numero di giunti coerente con la config."""
+    return _JOINTS_N[_joints_mode(cfg)]
 
 
 class _SampleView(torch.utils.data.Dataset):
@@ -203,9 +222,13 @@ def build_model(cfg: Dict) -> nn.Module:
             # skeleton: use_skeleton vive sotto `data:` (le pose nascono nel
             # dataset), i parametri architetturali sotto `model:`
             use_skeleton=cfg["data"].get("use_skeleton", False),
+            skeleton_encoder=cfg["model"].get("skeleton_encoder", "gtranspdm"),
             skeleton_n_joints=_skeleton_joints(cfg),
             skeleton_hidden=cfg["model"].get("skeleton_hidden", 64),
             skeleton_layers=cfg["model"].get("skeleton_layers", 4),
+            stgat_channels=tuple(cfg["model"].get("stgat_channels", [32, 64, 64])),
+            stgat_kt=cfg["model"].get("stgat_kt", 9),
+            stgat_velocity=cfg["model"].get("stgat_velocity", True),
         )
     raise ValueError(f"Modello non supportato: {name}.")
 
@@ -352,6 +375,12 @@ def main():
     bbox_norm  = data_cfg.get("bbox_normalization", "raw")
     speed_norm = data_cfg.get("speed_normalization", "raw")
     drop_ff    = data_cfg.get("drop_first_frame", False)
+    # Modalita' dei giunti: dataset e modello devono concordare.
+    _jmode = _joints_mode(cfg)
+    if data_cfg.get("use_skeleton", False):
+        print(f"\n[INFO] skeleton_joints_mode={_jmode} "
+              f"({_JOINTS_N[_jmode]} keypoint)")
+
     _geom = dict(
         use_pdm=data_cfg.get("use_pdm", False),
         use_polar=data_cfg.get("use_polar", False),
@@ -365,7 +394,11 @@ def main():
         use_skeleton=data_cfg.get("use_skeleton", False),
         pose_dir=data_cfg.get("pose_dir", "data/poses"),
         skeleton_norm=data_cfg.get("skeleton_norm", "bbox_topleft"),
-        skeleton_add_extra_joints=data_cfg.get("skeleton_add_extra_joints", True),
+        skeleton_joints_mode=_jmode,
+        pose_interpolate=data_cfg.get("pose_interpolate", False),
+        pose_max_gap=data_cfg.get("pose_max_gap", 2),
+        pose_interp_confidence=data_cfg.get("pose_interp_confidence", 0.5),
+        pose_conf_threshold=data_cfg.get("pose_conf_threshold", 0.0),
     )
     
     # ── Modalita' di validation ──────────────────────────────────────────
