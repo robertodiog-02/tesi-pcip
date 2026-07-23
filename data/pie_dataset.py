@@ -37,6 +37,7 @@ try:
     from .geometry import (compute_pdm, compute_tripolar, pdm_dim, tripolar_dim,
                            bbox_track_feature, track_feature_dim)
     from .windowing import iter_windows, window_step
+    from .dinov3_reader import DinoV3Reader
     from .pose_loader import (load_pose_index, extract_window_poses,
                               normalize_keypoints, add_extra_joints,
                               frame_number_from_path, skeleton_n_joints,
@@ -45,6 +46,7 @@ except ImportError:
     from geometry import (compute_pdm, compute_tripolar, pdm_dim, tripolar_dim,
                           bbox_track_feature, track_feature_dim)
     from windowing import iter_windows, window_step
+    from dinov3_reader import DinoV3Reader
     from pose_loader import (load_pose_index, extract_window_poses,
                              normalize_keypoints, add_extra_joints,
                              frame_number_from_path, skeleton_n_joints,
@@ -110,6 +112,12 @@ def build_samples(
     pose_max_gap:        int  = 2,
     pose_interp_confidence: float = 0.5,
     pose_conf_threshold: float = 0.0,
+    use_global_context:  bool = False,
+    use_roi:             bool = False,
+    visual_reader=None,          # DinoV3Reader condiviso
+    roi_scale:           float = 1.5,
+    roi_size:            int  = 3,
+    visual_dim:          int  = 768,
 ) -> List[Dict]:
     """
     Costruisce i sample seguendo il protocollo temporale Kotseruba WACV 2021.
@@ -134,6 +142,14 @@ def build_samples(
     print(f"  ego-speed disponibile: "
           f"{'SI' if (obd_all is not None and gps_all is not None) else 'NO'}")
     print(f"  >>> Bbox Norm: {bbox_normalization} | Speed Norm: {speed_normalization} | Drop First: {drop_first_frame}")
+    if use_global_context or use_roi:
+        assert visual_reader is not None, \
+            "use_global_context/use_roi richiedono visual_reader (DinoV3Reader)"
+        assert images_all is not None, \
+            "le feature visive richiedono i path immagine (chiave 'image')"
+        print(f"  >>> Visive DINOv3: cls={use_global_context}, roi={use_roi} "
+              f"(scale={roi_scale}, size={roi_size}, dim={visual_dim})")
+
     if use_pdm or use_polar:
         print(f"  >>> Geometria: PDM={use_pdm} (area_ratio={pdm_use_area_ratio}, "
               f"keep_abs={pdm_keep_absolute}) | "
@@ -180,11 +196,23 @@ def build_samples(
         obd_track = obd_all[i] if obd_all is not None else None
         gps_track = gps_all[i] if gps_all is not None else None
 
-        # numeri di frame della traccia (per l'allineamento delle pose)
-        if use_skeleton:
+        # Numeri di frame della traccia: servono ad allineare sia le pose sia
+        # le feature visive DINOv3, che sono indicizzate per numero di frame.
+        track_frames = None
+        if use_skeleton or use_global_context or use_roi:
             track_frames = np.array(
                 [frame_number_from_path(im) for im in images_all[i]],
                 dtype=np.int64)
+
+        # set/video della traccia, per la ricerca nelle feature visive
+        _sid = _vid = None
+        if use_global_context or use_roi:
+            _parts = str(images_all[i][0]).replace("\\", "/").split("/")
+            _sid = next((x for x in _parts if x.startswith("set")), None)
+            _vid = next((x for x in _parts if x.startswith("video_")), None)
+            if _sid is None or _vid is None:
+                raise ValueError(
+                    f"impossibile dedurre set/video dal path: {images_all[i][0]}")
 
         # Finestre dal protocollo condiviso (windowing.py): unica fonte di
         # verita', usata anche da viz_skeleton e dall'estrattore di feature.
@@ -273,6 +301,23 @@ def build_samples(
             else:
                 polar_feat = np.zeros((eff_len, 1), dtype=np.float32)
 
+            # --- FEATURE VISIVE DINOv3 (allineate per numero di frame) ---
+            if use_global_context or use_roi:
+                win_frames_v = track_frames[w_start:w_end]
+
+            if use_global_context:
+                cls_full = visual_reader.get_window_cls(_sid, _vid, win_frames_v)
+                cls_feat = cls_full[1:] if drop_first_frame else cls_full
+            else:
+                cls_feat = np.zeros((eff_len, 1), dtype=np.float32)
+
+            if use_roi:
+                roi_full = visual_reader.get_window_roi(
+                    _sid, _vid, ped_id, win_frames_v, scale=roi_scale, size=roi_size)
+                roi_feat = roi_full[1:] if drop_first_frame else roi_full
+            else:
+                roi_feat = np.zeros((eff_len, 1, 1, 1), dtype=np.float32)
+
             # --- PREPROCESSO SPEED ---
             ego_speed_seq = np.zeros((eff_len, 1), dtype=np.float32)
             if speed_normalization == "raw":
@@ -304,6 +349,8 @@ def build_samples(
                 "pdm":               pdm_feat.astype(np.float32),
                 "polar":             polar_feat.astype(np.float32),
                 "keypoints":         kp_feat.astype(np.float32),
+                "cls":               cls_feat.astype(np.float32),
+                "roi":               roi_feat.astype(np.float32),
                 "ego_speed":         ego_speed_seq.astype(np.float32),
                 "label":             np.int64(label),
             })
@@ -355,6 +402,12 @@ class PIEDataset(Dataset):
         pose_max_gap:        int  = 2,
         pose_interp_confidence: float = 0.5,
         pose_conf_threshold: float = 0.0,
+        use_global_context:  bool = False,
+        use_roi:             bool = False,
+        visual_feat_dir:     str  = "features/dinov3",
+        roi_scale:           float = 1.5,
+        roi_size:            int  = 3,
+        visual_dim:          int  = 768,
         sample_type:    str = "all",
     ):
         assert split in ("train", "val", "test")
@@ -384,6 +437,11 @@ class PIEDataset(Dataset):
             print(f"Caricamento pose da {pose_dir}...")
             pose_index = load_pose_index(pose_dir)
 
+        visual_reader = None
+        if use_global_context or use_roi:
+            print(f"Apertura feature visive da {visual_feat_dir}...")
+            visual_reader = DinoV3Reader(visual_feat_dir)
+
         self.samples = build_samples(
             sequences, obs_len,
             bbox_normalization=bbox_normalization,
@@ -406,6 +464,12 @@ class PIEDataset(Dataset):
             pose_max_gap=pose_max_gap,
             pose_interp_confidence=pose_interp_confidence,
             pose_conf_threshold=pose_conf_threshold,
+            use_global_context=use_global_context,
+            use_roi=use_roi,
+            visual_reader=visual_reader,
+            roi_scale=roi_scale,
+            roi_size=roi_size,
+            visual_dim=visual_dim,
         )
 
         # dimensioni effettive delle feature (servono a costruire il modello)
@@ -417,13 +481,15 @@ class PIEDataset(Dataset):
         self.delta_dim = track_feature_dim(delta_type)
         self.skeleton_joints = (skeleton_n_joints(skeleton_joints_mode)
                                 if use_skeleton else 0)
+        self.use_global_context = use_global_context
+        self.use_roi = use_roi
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict:
         s = self.samples[idx]
-        return {
+        item = {
             "bbox":              torch.from_numpy(s["bbox"]),
             "bbox_displacement": torch.from_numpy(s["bbox_displacement"]),
             "bbox_delta":        torch.from_numpy(s["bbox_delta"]),
@@ -434,6 +500,12 @@ class PIEDataset(Dataset):
             "label":             torch.tensor(s["label"], dtype=torch.long),
             "ped_id":            s["ped_id"],
         }
+        # cls/roi solo se il dataset li produce (feature visive attive)
+        if self.use_global_context:
+            item["cls"] = torch.from_numpy(s["cls"])
+        if self.use_roi:
+            item["roi"] = torch.from_numpy(s["roi"])
+        return item
 
     def get_class_weights(self) -> torch.Tensor:
         labels  = np.array([s["label"] for s in self.samples])

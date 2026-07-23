@@ -39,8 +39,6 @@ class BaselineGRU(nn.Module):
         use_bbox:       bool  = True,
         use_bbox_displacement: bool = False,
         use_bbox_delta: bool  = True,
-        use_pdm:        bool  = False,
-        use_polar:      bool  = False,
         use_ego_speed:  bool  = False,
     ):
         super().__init__()
@@ -499,6 +497,128 @@ class PoseSTGAT(nn.Module):
         return self.fc_out(x.reshape(B, T, -1))
 
 
+
+
+# ─── Encoder feature visive DINOv3 ───────────────────────────────────────────
+
+class GlobalContextEncoder(nn.Module):
+    """CLS token DINOv3 -> [B, T, d_model]. Contesto globale della scena."""
+
+    def __init__(self, in_dim: int, d_model: int, dropout: float = 0.0):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, cls: torch.Tensor) -> torch.Tensor:
+        """cls: [B, T, in_dim] -> [B, T, d_model]"""
+        return self.proj(cls)
+
+
+class RoiEncoder(nn.Module):
+    """
+    ROI Align DINOv3 -> [B, T, d_model].
+
+    Il crop e' [B, T, S, S, in_dim]. Riduzione configurabile:
+        "flatten" : appiattisce S*S*in_dim -> Linear (tiene la struttura
+                    spaziale ma tanti parametri)
+        "mean"    : media sulle S*S celle -> Linear (leggero; con S=1
+                    coincide con l'unico vettore)
+    """
+
+    def __init__(self, in_dim: int, roi_size: int, d_model: int,
+                 reduce: str = "flatten", dropout: float = 0.0):
+        super().__init__()
+        assert reduce in ("flatten", "mean")
+        self.reduce = reduce
+        self.roi_size = roi_size
+        flat_dim = in_dim * roi_size * roi_size if reduce == "flatten" else in_dim
+        self.proj = nn.Sequential(
+            nn.Linear(flat_dim, d_model),
+            nn.LayerNorm(d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, roi: torch.Tensor) -> torch.Tensor:
+        """roi: [B, T, S, S, in_dim] -> [B, T, d_model]"""
+        B, T = roi.shape[0], roi.shape[1]
+        if self.reduce == "mean":
+            x = roi.mean(dim=(2, 3))                 # [B, T, in_dim]
+        else:
+            x = roi.reshape(B, T, -1)                # [B, T, S*S*in_dim]
+        return self.proj(x)
+
+
+# ─── Cross-Modal Encoder (PedFormer, eq. 1-2) ────────────────────────────────
+
+class CrossModalEncoder(nn.Module):
+    """
+    Attention a coppie tra modalita' (PedFormer, cross-modal attention
+    modulation). Ogni modalita' fa da QUERY e attinge alle altre lungo l'asse
+    TEMPORALE, prima della fusione.
+
+        modo "full"          : ogni modalita' interroga TUTTE le altre
+                               (O(m^2) unita' di attention)
+        modo "to_kinematics" : le modalita' non-cinematiche interrogano solo
+                               la cinematica e viceversa, saltando le coppie
+                               ridondanti (es. displacement<->delta)
+
+    Ogni modalita' esce arricchita: out_i = FC(Concat[attn(i->j) for j != i]).
+    Le liste di modalita' hanno nomi, cosi' "to_kinematics" sa chi e' cinematico.
+    """
+
+    def __init__(self, names, d_model: int, nhead: int = 4,
+                 mode: str = "full", dropout: float = 0.1,
+                 kinematic_names=None):
+        super().__init__()
+        assert mode in ("full", "to_kinematics")
+        self.names = list(names)
+        self.mode = mode
+        self.kin = set(kinematic_names or [])
+
+        # per ogni modalita' query, le sorgenti che interroga
+        self.sources = {}
+        for q in self.names:
+            if mode == "full":
+                src = [k for k in self.names if k != q]
+            else:  # to_kinematics
+                if q in self.kin:
+                    src = [k for k in self.names if k not in self.kin]
+                else:
+                    src = [k for k in self.names if k in self.kin]
+                if not src:                        # fallback: nessuna sorgente
+                    src = [k for k in self.names if k != q]
+            self.sources[q] = src
+
+        # una MultiheadAttention per ogni coppia (query, source)
+        self.attn = nn.ModuleDict()
+        self.out_proj = nn.ModuleDict()
+        for q in self.names:
+            for k in self.sources[q]:
+                self.attn[f"{q}__{k}"] = nn.MultiheadAttention(
+                    d_model, nhead, dropout=dropout, batch_first=True)
+            n_src = max(1, len(self.sources[q]))
+            self.out_proj[q] = nn.Linear(n_src * d_model, d_model)
+        self.norm = nn.ModuleDict({q: nn.LayerNorm(d_model) for q in self.names})
+
+    def forward(self, feats: dict) -> dict:
+        """feats: {name: [B,T,d]} -> {name: [B,T,d]} arricchiti."""
+        out = {}
+        for q in self.names:
+            heads = []
+            for k in self.sources[q]:
+                a, _ = self.attn[f"{q}__{k}"](feats[q], feats[k], feats[k])
+                heads.append(a)
+            if heads:
+                fused = self.out_proj[q](torch.cat(heads, dim=-1))
+            else:
+                fused = feats[q]
+            out[q] = self.norm[q](feats[q] + fused)     # residuo
+        return out
+
+
 class TransformerModalityNet(nn.Module):
     """
     Transformer Modality Network.
@@ -634,6 +754,16 @@ class TransformerModalityNet(nn.Module):
         stgat_channels        = (32, 64, 64),  # canali dei layer STGAT (paper: 3 layer)
         stgat_kt:       int   = 9,         # kernel temporale del TCN
         stgat_velocity: bool  = True,      # velocity attention (SE con ego-speed)
+        # --- feature visive DINOv3 ---
+        use_global_context: bool = False,  # CLS token (contesto globale)
+        use_roi:        bool  = False,     # ROI crop (contesto locale)
+        visual_dim:     int   = 768,       # hidden_dim di DINOv3
+        roi_size:       int   = 3,         # lato griglia ROI (1 o 3)
+        roi_reduce:     str   = "flatten", # "flatten" | "mean"
+        visual_dropout: float = 0.1,
+        # --- cross-modal encoder (PedFormer) ---
+        cross_modal:    str   = "off",     # "off" | "full" | "to_kinematics"
+        cross_modal_heads: int = 4,
     ):
         super().__init__()
         assert pooling in ("cls", "last", "mean", "flatten", "attention"), \
@@ -711,7 +841,18 @@ class TransformerModalityNet(nn.Module):
                 n_layers=skeleton_layers,
             )
 
-        n_modalities = len(self.projections) + int(use_skeleton)
+        # ── Encoder visivi (rami indipendenti) ──
+        self.use_global_context = use_global_context
+        self.use_roi = use_roi
+        self.global_encoder = (
+            GlobalContextEncoder(visual_dim, hidden_dim, visual_dropout)
+            if use_global_context else None)
+        self.roi_encoder = (
+            RoiEncoder(visual_dim, roi_size, hidden_dim, roi_reduce, visual_dropout)
+            if use_roi else None)
+
+        n_modalities = (len(self.projections) + int(use_skeleton)
+                        + int(use_global_context) + int(use_roi))
         assert n_modalities > 0, (
             "Almeno una feature di input deve essere attiva (use_bbox, "
             "use_polar, use_pdm, use_bbox_displacement, use_bbox_delta o "
@@ -741,7 +882,8 @@ class TransformerModalityNet(nn.Module):
 
             # Livello 2: fusione tra encoder (GTransPDM eq. 8)
             # X = FC(Concat[X_pe, X_ev, X_ke])
-            n_branches = int(n_kin > 0) + int(use_ego_speed) + int(use_skeleton)
+            n_branches = (int(n_kin > 0) + int(use_ego_speed) + int(use_skeleton)
+                          + int(use_global_context) + int(use_roi))
             self.proj_fusion = nn.Linear(n_branches * hidden_dim, hidden_dim)
             self.proj_joint = None
         else:
@@ -750,6 +892,17 @@ class TransformerModalityNet(nn.Module):
             self.proj_kinematics = None
             self.proj_ego = None
             self.proj_fusion = None
+
+        # ── Cross-Modal Encoder (opzionale, PedFormer) ──
+        # Opera sui token delle singole modalita' PRIMA della fusione.
+        self.cross_modal_mode = cross_modal
+        if cross_modal != "off":
+            names, kin = self._modality_names()
+            self.cross_modal = CrossModalEncoder(
+                names, hidden_dim, nhead=cross_modal_heads,
+                mode=cross_modal, dropout=dropout, kinematic_names=kin)
+        else:
+            self.cross_modal = None
 
         # 3. CLS token
         if pooling == "cls":
@@ -782,6 +935,35 @@ class TransformerModalityNet(nn.Module):
         self.decoder = _build_head(
             head_in, 1, head_layers, head_hidden or hidden_dim, head_dropout)
 
+    def _modality_names(self):
+        """(lista nomi modalita' attive, insieme dei nomi cinematici)."""
+        names, kin = [], []
+        if self.use_bbox:              names.append("box");   kin.append("box")
+        if self.use_pdm:               names.append("pdm");   kin.append("pdm")
+        if self.use_polar:             names.append("polar"); kin.append("polar")
+        if self.use_bbox_displacement: names.append("disp");  kin.append("disp")
+        if self.use_bbox_delta:        names.append("delta"); kin.append("delta")
+        if self.use_ego_speed:         names.append("speed")
+        if self.use_skeleton:          names.append("skeleton")
+        if self.use_global_context:    names.append("cls")
+        if self.use_roi:               names.append("roi")
+        return names, kin
+
+    def _encode_modalities(self, bbox, disp, delta, speed, pdm, polar,
+                           keypoints, cls, roi):
+        """Costruisce il token [B,T,d] di OGNI modalita' attiva, come dict."""
+        f = {}
+        if self.use_bbox:              f["box"]   = self.projections["box"](bbox)
+        if self.use_pdm:               f["pdm"]   = self.projections["pdm"](pdm)
+        if self.use_polar:             f["polar"] = self.projections["polar"](polar)
+        if self.use_bbox_displacement: f["disp"]  = self.projections["box_displacement"](disp)
+        if self.use_bbox_delta:        f["delta"] = self.projections["box_delta"](delta)
+        if self.use_ego_speed:         f["speed"] = self.projections["speed"](speed)
+        if self.use_skeleton:          f["skeleton"] = self._encode_skeleton(keypoints, speed)
+        if self.use_global_context:    f["cls"]   = self.global_encoder(cls)
+        if self.use_roi:               f["roi"]   = self.roi_encoder(roi)
+        return f
+
     def _encode_skeleton(self, keypoints, ego_speed):
         """Applica l'encoder posa; STGAT riceve anche la velocita'."""
         if self.skeleton_encoder_type == "stgat":
@@ -797,65 +979,47 @@ class TransformerModalityNet(nn.Module):
         pdm:               torch.Tensor = None,
         polar:             torch.Tensor = None,
         keypoints:         torch.Tensor = None,   # [B, T, N, 3]
+        cls:               torch.Tensor = None,   # [B, T, visual_dim]
+        roi:               torch.Tensor = None,   # [B, T, S, S, visual_dim]
     ) -> torch.Tensor:
         B, T = bbox.shape[0], bbox.shape[1]
 
-        if self.separate_encoder_speed_kinematics:
-            # ── Livello 1a: ramo cinematico (bbox / displacement / delta) ──
-            kin_feats = []
-            if self.use_bbox:
-                kin_feats.append(self.projections["box"](bbox))
-            if self.use_pdm:
-                kin_feats.append(self.projections["pdm"](pdm))
-            if self.use_polar:
-                kin_feats.append(self.projections["polar"](polar))
-            if self.use_bbox_displacement:
-                kin_feats.append(self.projections["box_displacement"](bbox_displacement))
-            if self.use_bbox_delta:
-                kin_feats.append(self.projections["box_delta"](bbox_delta))
+        # ── Token per modalita' + cross-modal (comune ai due tipi di fusione) ──
+        feats = self._encode_modalities(bbox, bbox_displacement, bbox_delta,
+                                        ego_speed, pdm, polar, keypoints, cls, roi)
+        if self.cross_modal is not None:
+            feats = self.cross_modal(feats)
 
+        if self.separate_encoder_speed_kinematics:
+            # ── Livello 1: rami per gruppo semantico ──
             branches = []
-            if kin_feats:
-                x_pe = torch.cat(kin_feats, dim=-1)
+            kin = [feats[k] for k in ("box", "pdm", "polar", "disp", "delta")
+                   if k in feats]
+            if kin:
+                x_pe = torch.cat(kin, dim=-1)
                 if self.proj_kinematics is not None:
                     x_pe = self.proj_kinematics(x_pe)
-                branches.append(x_pe)                       # [B, T, d_model]
-
-            # ── Livello 1b: ramo ego-motion (speed), percorso separato ──
-            if self.use_ego_speed:
-                x_ev = self.projections["speed"](ego_speed)
+                branches.append(x_pe)                       # X_pe
+            if "speed" in feats:
+                x_ev = feats["speed"]
                 if self.proj_ego is not None:
                     x_ev = self.proj_ego(x_ev)
-                branches.append(x_ev)                       # [B, T, d_model]
+                branches.append(x_ev)                       # X_ev
+            if "skeleton" in feats:
+                branches.append(feats["skeleton"])          # X_ke
+            if "cls" in feats:
+                branches.append(feats["cls"])               # contesto globale
+            if "roi" in feats:
+                branches.append(feats["roi"])               # contesto locale
 
-            # ── Livello 1c: ramo skeleton (X_ke) ──
-            # Con STGAT la velocita' entra DENTRO l'encoder (velocity
-            # attention), non solo come ramo separato.
-            if self.use_skeleton:
-                branches.append(self._encode_skeleton(keypoints, ego_speed))
-
-            # ── Livello 2: fusione tra encoder (eq. 8) ──
+            # ── Livello 2: fusione tra rami (eq. 8) ──
             x = self.proj_fusion(torch.cat(branches, dim=-1))  # [B, T, d_model]
         else:
-            # ── Fusione piatta: tutto insieme ──
-            proj_feats = []
-            if self.use_bbox:
-                proj_feats.append(self.projections["box"](bbox))
-            if self.use_pdm:
-                proj_feats.append(self.projections["pdm"](pdm))
-            if self.use_polar:
-                proj_feats.append(self.projections["polar"](polar))
-            if self.use_bbox_displacement:
-                proj_feats.append(self.projections["box_displacement"](bbox_displacement))
-            if self.use_bbox_delta:
-                proj_feats.append(self.projections["box_delta"](bbox_delta))
-            if self.use_ego_speed:
-                proj_feats.append(self.projections["speed"](ego_speed))
-
-            if self.use_skeleton:
-                proj_feats.append(self._encode_skeleton(keypoints, ego_speed))
-
-            x = torch.cat(proj_feats, dim=-1)   # [B, T, n_modalities * d_model]
+            # ── Fusione piatta: tutte le modalita' insieme ──
+            order = ("box", "pdm", "polar", "disp", "delta", "speed",
+                     "skeleton", "cls", "roi")
+            proj_feats = [feats[k] for k in order if k in feats]
+            x = torch.cat(proj_feats, dim=-1)
             x = self.proj_joint(x)              # [B, T, d_model]
 
         # ── Positional encoding, poi CLS ──
