@@ -34,6 +34,17 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 
+def _basename_any_os(path: str) -> str:
+    """
+    Nome del file da un path generato su QUALSIASI sistema operativo.
+
+    Serve perche' Path("a\\b\\c.h5").name su Linux/macOS restituisce
+    l'intera stringa: il backslash non e' un separatore su POSIX. Un index
+    creato su Windows e riletto sul Mac (o viceversa) va normalizzato.
+    """
+    return str(path).replace("\\", "/").rstrip("/").split("/")[-1]
+
+
 def rebuild_from_h5(feat_dir: Path) -> dict:
     """Ricostruisce l'indice leggendo direttamente gli .h5 (nessun pickle)."""
     import h5py
@@ -109,10 +120,14 @@ def main():
             for (sid, vid), n in dup.most_common(10):
                 print(f"    {sid}/{vid}: {n}")
 
-        # ── ripara i path: gli assoluti di un'altra macchina non valgono qui ──
+        # ── ripara i path ──
+        # Gli assoluti di un'altra macchina non valgono qui. Attenzione ai
+        # separatori: un index generato su Windows contiene backslash, che su
+        # macOS/Linux NON sono separatori — Path() vedrebbe tutta la stringa
+        # come un unico nome di file. Normalizziamo prima di estrarre il nome.
         fixed = missing = 0
         for k, v in merged.items():
-            name = Path(v["h5"]).name
+            name = _basename_any_os(v["h5"])
             local = feat_dir / name
             if local.exists():
                 if v["h5"] != str(local):

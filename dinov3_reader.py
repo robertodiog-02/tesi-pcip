@@ -42,6 +42,7 @@ class DinoV3Reader:
 
         self._cache_files = cache_files
         self._open: Dict[str, "h5py.File"] = {}
+        self._resolved: Dict[str, str] = {}
 
         # indici derivati per la navigazione
         self._by_video = defaultdict(lambda: {"frames": set(), "peds": set()})
@@ -54,7 +55,28 @@ class DinoV3Reader:
                 self._by_video[(sid, vid)]["peds"].add(ped)
 
     # ── gestione file ────────────────────────────────────────────────────
+    def _resolve(self, path: str) -> str:
+        """
+        Path utilizzabile su QUESTA macchina.
+
+        Un indice creato su Windows contiene backslash, che su macOS/Linux non
+        sono separatori: Path() vedrebbe l'intera stringa come nome di file.
+        Se il path cosi' com'e' non esiste, si ripiega sul nome del file dentro
+        la cartella delle feature.
+        """
+        if path in self._resolved:
+            return self._resolved[path]
+        p = path
+        if not Path(p).exists():
+            name = str(path).replace("\\", "/").rstrip("/").split("/")[-1]
+            cand = self.dir / name
+            if cand.exists():
+                p = str(cand)
+        self._resolved[path] = p
+        return p
+
     def _file(self, path: str):
+        path = self._resolve(path)
         if not self._cache_files:
             return self._h5py.File(path, "r")
         if path not in self._open:
