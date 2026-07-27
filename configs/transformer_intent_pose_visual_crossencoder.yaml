@@ -1,5 +1,5 @@
 experiment:
-  name: transformer_intent_model_last_token_again
+  name: replica_esperimento_last_token_kinematics_speed_convalidationesterno_separateencoderfalse
   seed: 42
 
 data:
@@ -82,7 +82,7 @@ data:
   #   bbox_topleft_scaled : come sopra ma diviso per (w, h) -> ~[0,1],
   #                         invariante alla distanza. Deviazione ablabile.
   #   none                : keypoint grezzi.
-  skeleton_norm: bbox_topleft
+  skeleton_norm: bbox_topleft_scaled
 
   # ── Cardinalita' dei keypoint ────────────────────────────────────────────
   # Le pose HigherHRNet sono COCO-17. I giunti aggiuntivi sono DERIVATI come
@@ -108,10 +108,10 @@ data:
   # Un buco di 1-2 frame azzerato crea un salto a zero e ritorno, segnale
   # spurio peggiore di una posizione stimata.
   pose_interpolate: false
-  pose_max_gap: 2                  # <= 2 frame = occlusione breve
+  pose_max_gap: 5                  # <= 2 frame = occlusione breve
   pose_interp_confidence: 0.5      # confidence dei punti interpolati: bassa,
                                    # cosi' il modello sa che sono stimati
-  pose_conf_threshold: 0.0         # un giunto e' mancante se conf <= questa
+  pose_conf_threshold: 0.4         # un giunto e' mancante se conf <= questa
 
   # ── Feature visive DINOv3 (rami CLS e ROI, indipendenti) ─────────────────
   # Richiedono l'estrazione con extract_dinov3_roi.py e la cartella feature.
@@ -189,12 +189,12 @@ model:
   #   full          : ogni modalita' interroga TUTTE le altre (O(m^2), pesante)
   #   to_kinematics : le modalita' non-cinematiche interrogano la cinematica
   #                   e viceversa, saltando le coppie ridondanti (piu' leggero)
-  cross_modal: off
+  cross_modal: "off"
   cross_modal_heads: 4
 
   # parametri di "stgat" — il paper usa 3 layer con canali 32,64,64
-  stgat_channels: [32, 64, 64]
-  stgat_kt: 9                      # kernel temporale del TCN
+  stgat_channels: [32, 32, 64]
+  stgat_kt: 3                      # kernel temporale del TCN
   stgat_velocity: true             # velocity attention.
                                    # NOTA: con true la velocita' entra sia
                                    # dentro la posa sia (se use_ego_speed)
@@ -235,7 +235,14 @@ training:
   val_stratified: true             # false = campionamento uniforme (sconsigliato:
                                    # su 80 pedoni la quota di crossing oscilla molto)
 
-  use_validation: false            # Allineato a benchmark_singlernn per addestrare sul dataset completo
+  use_validation: true          # Allineato a benchmark_singlernn per addestrare sul dataset completo
+  eval_test_every_epoch: true     # Se true, valuta il TEST set ad ogni epoca (oltre a train/val)
+
+  # Gradient clipping (max norm del gradiente):
+  #   1.0 (default): clip a 1.0
+  #   null / false / 0: disattivato (nessun clipping)
+  #   es. 0.5, 2.0, 5.0
+  grad_clip: 1.0
 
   # Class weights della loss: [w_neg, w_pos].
   # Con BCE viene usato come pos_weight = w_pos / w_neg.

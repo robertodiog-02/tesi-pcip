@@ -37,7 +37,6 @@ try:
     from .geometry import (compute_pdm, compute_tripolar, pdm_dim, tripolar_dim,
                            bbox_track_feature, track_feature_dim)
     from .windowing import iter_windows, window_step
-    from .dinov3_reader import DinoV3Reader
     from .pose_loader import (load_pose_index, extract_window_poses,
                               normalize_keypoints, add_extra_joints,
                               frame_number_from_path, skeleton_n_joints,
@@ -46,11 +45,18 @@ except ImportError:
     from geometry import (compute_pdm, compute_tripolar, pdm_dim, tripolar_dim,
                           bbox_track_feature, track_feature_dim)
     from windowing import iter_windows, window_step
-    from dinov3_reader import DinoV3Reader
     from pose_loader import (load_pose_index, extract_window_poses,
                              normalize_keypoints, add_extra_joints,
                              frame_number_from_path, skeleton_n_joints,
                              interpolate_occlusions)
+
+try:
+    from .dinov3_reader import DinoV3Reader
+except ImportError:
+    try:
+        from dinov3_reader import DinoV3Reader
+    except ImportError:
+        DinoV3Reader = None
 
 OBS_LEN = 16
 TTE_MIN = 30   # frame (~1s)

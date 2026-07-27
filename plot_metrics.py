@@ -27,12 +27,13 @@ from sklearn.metrics import confusion_matrix
 
 
 METRICS = [
-    ("loss",      "Loss"),
-    ("acc",       "Accuracy"),
-    ("f1",        "F1 Score"),
-    ("auc",       "AUC (ROC)"),
-    ("precision", "Precision"),
-    ("recall",    "Recall"),
+    ("loss",         "Loss"),
+    ("acc",          "Accuracy"),
+    ("balanced_acc", "Balanced Accuracy (Benchmark AUC)"),
+    ("f1",           "F1 Score"),
+    ("auc",          "AUC (ROC)"),
+    ("precision",    "Precision"),
+    ("recall",       "Recall"),
 ]
 
 CLASS_NAMES = ["Non-crossing", "Crossing"]

@@ -39,6 +39,8 @@ class BaselineGRU(nn.Module):
         use_bbox:       bool  = True,
         use_bbox_displacement: bool = False,
         use_bbox_delta: bool  = True,
+        use_pdm:        bool  = False,
+        use_polar:      bool  = False,
         use_ego_speed:  bool  = False,
     ):
         super().__init__()
@@ -202,8 +204,8 @@ class SkeletonEncoder(nn.Module):
         B, T, N, C = keypoints.shape
 
         # BatchNorm sull'input
-        x = keypoints.reshape(B, T, N * C).transpose(1, 2)   # [B, N*C, T]
-        x = self.input_bn(x).transpose(1, 2).reshape(B, T, N, C)
+        x = keypoints.reshape(B, T, N * C).transpose(1, 2).contiguous()   # [B, N*C, T]
+        x = self.input_bn(x).transpose(1, 2).contiguous().reshape(B, T, N, C)
 
         for l, (E, W) in enumerate(zip(self.edge_importance, self.weights)):
             adj = self.adj * E                                # E_l (*) A_hat
@@ -215,11 +217,11 @@ class SkeletonEncoder(nn.Module):
             else:
                 # Conv2D(H_{l-1}): [B, C, T, N]
                 res = self.residuals[l - 1](
-                    x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+                    x.permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()
                 x = self.relu(h + res)
 
         # Flatten sui giunti, FC -> [B, T, C_d]  (eq. 7)
-        return self.fc_out(x.reshape(B, T, -1))
+        return self.fc_out(x.contiguous().reshape(B, T, -1))
 
 
 
@@ -422,14 +424,14 @@ class STGATLayer(nn.Module):
         res = 0.0
         if self.residual is not None:
             res = (x if isinstance(self.residual, nn.Identity)
-                   else self.residual(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1))
+                   else self.residual(x.permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous())
 
         # GCN partizionato: somma sui 3 gruppi, pesi distinti (eq. 20)
         adj = self.adj * self.edge_importance
         out = 0.0
         for k in range(self.n_part):
             out = out + self.weights[k](torch.matmul(adj[k], x))
-        out = self.bn_gcn(out.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        out = self.bn_gcn(out.permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()
         out = self.relu(out)
 
         # Velocity Attention (channel-wise)
@@ -437,7 +439,7 @@ class STGATLayer(nn.Module):
             out = self.vel_attn(out, speed)
 
         # TCN lungo il tempo
-        out = self.tcn(out.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        out = self.tcn(out.permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()
         return self.relu(out + res)
 
 
@@ -488,13 +490,13 @@ class PoseSTGAT(nn.Module):
                 speed: Optional[torch.Tensor] = None) -> torch.Tensor:
         """keypoints: [B,T,N,3], speed: [B,T,1] -> [B, T, out_dim]"""
         B, T, N, C = keypoints.shape
-        x = keypoints.reshape(B, T, N * C).transpose(1, 2)
-        x = self.input_bn(x).transpose(1, 2).reshape(B, T, N, C)
+        x = keypoints.reshape(B, T, N * C).transpose(1, 2).contiguous()
+        x = self.input_bn(x).transpose(1, 2).contiguous().reshape(B, T, N, C)
 
         for layer in self.layers:
             x = layer(x, speed)
 
-        return self.fc_out(x.reshape(B, T, -1))
+        return self.fc_out(x.contiguous().reshape(B, T, -1))
 
 
 
@@ -895,6 +897,11 @@ class TransformerModalityNet(nn.Module):
 
         # ── Cross-Modal Encoder (opzionale, PedFormer) ──
         # Opera sui token delle singole modalita' PRIMA della fusione.
+        if isinstance(cross_modal, bool):
+            cross_modal = "full" if cross_modal else "off"
+        elif cross_modal is None or str(cross_modal).lower() in ("off", "false", "none", "no"):
+            cross_modal = "off"
+
         self.cross_modal_mode = cross_modal
         if cross_modal != "off":
             names, kin = self._modality_names()

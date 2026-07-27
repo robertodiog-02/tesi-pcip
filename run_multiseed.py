@@ -60,7 +60,7 @@ def main():
             metrics = json.load(f)
         results[seed] = metrics.get("test", {})
         t = results[seed]
-        print(f"  -> seed {seed}: f1={t.get('f1'):.4f} acc={t.get('acc'):.4f} "
+        print(f"  -> seed {seed}: f1={t.get('f1'):.4f} acc={t.get('acc'):.4f} b_acc={t.get('balanced_acc'):.4f} "
               f"P={t.get('precision'):.4f} R={t.get('recall'):.4f} auc={t.get('auc'):.4f}")
 
     if len(results) == 0:
@@ -71,7 +71,7 @@ def main():
     print("\n" + "=" * 70)
     print("RIEPILOGO SUL TEST SET (media +/- dev.std su", len(results), "run)")
     print("=" * 70)
-    metric_names = ["f1", "acc", "auc", "precision", "recall"]
+    metric_names = ["f1", "acc", "balanced_acc", "auc", "precision", "recall"]
     summary = {}
     header = f"{'seed':>6} | " + " | ".join(f"{m:>9}" for m in metric_names)
     print(header)
