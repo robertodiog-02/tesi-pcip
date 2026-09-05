@@ -43,6 +43,9 @@ from data.val_split import load_or_create_split, split_samples, describe_split
 from models.models import BaselineGRU, TransformerModalityNet
 from models.models_benchmark import BenchmarkSingleRNN
 from plot_metrics import plot_metric_curves, plot_confusion_matrices
+from losses import (
+    build_criterion, resolve_loss_name, num_outputs_for, calibration_report,
+)
 
 
 # ─── Utility ──────────────────────────────────────────────────────────────────
@@ -169,7 +172,13 @@ class _SampleView(torch.utils.data.Dataset):
         return torch.tensor([w_neg, w_pos], dtype=torch.float32)
 
 
-def build_model(cfg: Dict) -> nn.Module:
+def build_model(cfg: Dict, num_outputs: int = None) -> nn.Module:
+    """Costruisce il modello.
+
+    `num_outputs` (1 o 2) e' deciso dalla loss scelta in config: la testa e il
+    tipo di loss devono essere coerenti, altrimenti il forward produce logit
+    della forma sbagliata. Se None si usa il default storico di ogni modello.
+    """
     name = cfg["model"]["name"]
     if name == "BaselineGRU":
         return BaselineGRU(
@@ -180,8 +189,15 @@ def build_model(cfg: Dict) -> nn.Module:
             use_bbox_displacement=cfg["model"].get("use_bbox_displacement", False),
             use_bbox_delta=cfg["model"].get("use_bbox_delta", True),
             use_ego_speed=cfg["model"].get("use_ego_speed", False),
+            **({} if num_outputs is None else {"num_outputs": num_outputs}),
         )
     if name == "BenchmarkSingleRNN":
+        if num_outputs is not None and num_outputs != 1:
+            raise ValueError(
+                "BenchmarkSingleRNN ha la testa a 1 logit. Per usare "
+                "training.loss='ce'/'mcel_ce' aggiungi il parametro "
+                "num_outputs anche a models_benchmark.py, oppure usa "
+                "loss='bce'/'mcel_bce'.")
         return BenchmarkSingleRNN(
             hidden_dim=cfg["model"]["hidden_dim"],
             num_layers=cfg["model"].get("num_layers", 1),
@@ -241,6 +257,7 @@ def build_model(cfg: Dict) -> nn.Module:
             visual_dropout=cfg["model"].get("visual_dropout", 0.1),
             cross_modal=cfg["model"].get("cross_modal", "off"),
             cross_modal_heads=cfg["model"].get("cross_modal_heads", 4),
+            **({} if num_outputs is None else {"num_outputs": num_outputs}),
         )
     raise ValueError(f"Modello non supportato: {name}.")
 
@@ -286,6 +303,10 @@ def run_epoch(model, loader, criterion, device, optimizer=None,
 
     total_loss, total = 0.0, 0
     all_labels, all_preds, all_probs = [], [], []
+    # Fase 1 — diagnostica: logit GREZZI (pre-clamping, pre-margine) e norma
+    # del gradiente PRIMA del clipping.
+    all_logits = []
+    gradnorm_sum, gradnorm_n, gradnorm_clipped = 0.0, 0, 0
 
     pbar = tqdm(loader, desc=desc, leave=False, ncols=100)
     grad_ctx = torch.enable_grad() if is_train else torch.no_grad()
@@ -314,21 +335,33 @@ def run_epoch(model, loader, criterion, device, optimizer=None,
                 logits = model(bbox, bbox_displacement, bbox_delta, ego_speed)
 
             if logits.dim() == 2 and logits.shape[-1] == 1:
-                # modello benchmark: 1 logit + BCEWithLogitsLoss
+                # testa a 1 logit: BCEWithLogitsLoss pesata / MCEL binaria
                 logits1 = logits.squeeze(-1)
                 loss = criterion(logits1, labels.float())
                 probs = torch.sigmoid(logits1)
                 preds = (probs >= 0.5).long()
+                raw_logits = logits1
             else:
-                # modello a 2 classi + CrossEntropyLoss
+                # testa a 2 logit: CrossEntropyLoss pesata / MCEL (Eq. 10)
                 loss = criterion(logits, labels)
                 probs = torch.softmax(logits, dim=-1)[:, 1]
                 preds = logits.argmax(dim=-1)
+                raw_logits = logits
 
             if is_train:
                 loss.backward()
-                if grad_clip is not None and float(grad_clip) > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
+                # clip_grad_norm_ restituisce la norma PRIMA del taglio: se resta
+                # stabilmente sopra grad_clip, e' il clip a dominare il passo,
+                # non la loss. Sintomo tipico di MCEL senza warmup del margine.
+                _max_norm = (float(grad_clip)
+                             if grad_clip is not None and float(grad_clip) > 0
+                             else float("inf"))
+                _gn = torch.nn.utils.clip_grad_norm_(model.parameters(), _max_norm)
+                _gn = float(_gn)
+                gradnorm_sum += _gn
+                gradnorm_n   += 1
+                if _max_norm != float("inf") and _gn > _max_norm:
+                    gradnorm_clipped += 1
                 optimizer.step()
 
             total_loss += loss.item() * len(labels)
@@ -336,6 +369,7 @@ def run_epoch(model, loader, criterion, device, optimizer=None,
             all_labels.extend(labels.detach().cpu().numpy().tolist())
             all_preds.extend(preds.detach().cpu().numpy().tolist())
             all_probs.extend(probs.detach().cpu().numpy().tolist())
+            all_logits.extend(raw_logits.detach().float().cpu().numpy().tolist())
 
             running_acc = np.mean(np.array(all_preds) == np.array(all_labels))
             pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{running_acc:.3f}")
@@ -343,14 +377,29 @@ def run_epoch(model, loader, criterion, device, optimizer=None,
     labels_np = np.array(all_labels)
     preds_np  = np.array(all_preds)
     probs_np  = np.array(all_probs)
+    logits_np = np.array(all_logits, dtype=np.float32)
 
     metrics = compute_metrics(labels_np, preds_np, probs_np)
     metrics["loss"] = total_loss / total
+
+    # ── Fase 1: calibrazione + geometria dei logit ────────────────────────
+    #   loss_plain     CE/BCE NON pesata sui logit grezzi. E' l'unica loss
+    #                  confrontabile tra run con criterion diverse.
+    #   ece            Expected Calibration Error.
+    #   mlm            Mean Logit Margin (Eq. 1 del paper MCEL).
+    #   logit_absmean  |logit| medio -> serve a tarare mcel_logit_scale.
+    metrics.update(calibration_report(logits_np, probs_np, labels_np))
+
+    if gradnorm_n > 0:
+        metrics["gradnorm"] = gradnorm_sum / gradnorm_n
+        metrics["gradclip_frac"] = gradnorm_clipped / gradnorm_n
 
     outputs = {
         "labels": all_labels,
         "preds":  all_preds,
         "probs":  all_probs,
+        # i logit servono per il temperature scaling post-hoc (Fase 4)
+        "logits": all_logits,
     }
     return metrics, outputs
 
@@ -509,8 +558,19 @@ def main():
     if eval_test_every_epoch:
         print("[INFO] eval_test_every_epoch=True -> Il TEST set verra' valutato ad ogni epoca.")
 
+    # -- Loss: decide anche la forma della testa ------------------------------
+    #   training.loss:  bce | ce | mcel_bce | mcel_ce
+    #     bce      -> 1 logit + BCEWithLogits pesata  (default storico per
+    #                 TransformerModalityNet / BenchmarkSingleRNN)
+    #     ce       -> 2 logit + CrossEntropyLoss(weight=[w_neg, w_pos])
+    #     mcel_bce -> 1 logit + MCEL binaria
+    #     mcel_ce  -> 2 logit + MCEL Eq. 10 (versione del paper)
+    #   Se la chiave manca, si replica il comportamento originale.
+    loss_name   = resolve_loss_name(train_cfg, cfg["model"]["name"])
+    n_outputs   = num_outputs_for(loss_name)
+
     # -- Modello --------------------------------------------------------------
-    model = build_model(cfg).to(device)
+    model = build_model(cfg, num_outputs=n_outputs).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Feature attive: bbox=True, "
           f"bbox_delta={getattr(model, 'use_bbox_delta', '?')}, "
@@ -527,19 +587,11 @@ def main():
     else:
         class_weights = train_ds.get_class_weights().to(device)
 
-    _is_bce = (cfg["model"]["name"] in ["BenchmarkSingleRNN", "TransformerModalityNet"])
-    if _is_bce:
-        _w_neg = float(class_weights[0]); _w_pos = float(class_weights[1])
-        _bce_none = nn.BCEWithLogitsLoss(reduction="none")
-        def criterion(logit1, target):
-            per = _bce_none(logit1, target)
-            w = torch.where(target > 0.5,
-                            torch.full_like(per, _w_pos),
-                            torch.full_like(per, _w_neg))
-            return (per * w).mean()
-        print(f"  Loss: BCE per-sample pesata come Keras (neg={_w_neg}, pos={_w_pos})")
-    else:
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion, _loss_desc = build_criterion(loss_name, train_cfg,
+                                            class_weights, device)
+    print(f"  Loss: {_loss_desc}")
+    if n_outputs == 2 and cfg["model"]["name"] == "TransformerModalityNet":
+        print("        (testa del Transformer a 2 logit invece di 1)")
 
     opt_name = str(train_cfg.get("optimizer", "adamw")).lower()
     wd = float(train_cfg.get("weight_decay", 0.0))
@@ -615,18 +667,25 @@ def main():
         elapsed = time.time() - t0
         lr_now  = scheduler.get_last_lr()[0] if scheduler is not None else lr
 
+        def _fmt(tag: str, m: Dict) -> str:
+            s = (f"  {tag} loss={m['loss']:.4f} acc={m['acc']:.4f} b_acc={m['balanced_acc']:.4f} "
+                 f"f1={m['f1']:.4f} auc={m['auc']:.4f} "
+                 f"P={m['precision']:.4f} R={m['recall']:.4f}\n")
+            # riga di diagnostica (Fase 1)
+            s += (f"  {' ' * len(tag)} plain={m['loss_plain']:.4f} ece={m['ece']:.4f} "
+                  f"mlm={m['mlm']:.2f} |logit|={m['logit_absmean']:.2f} "
+                  f"max={m['logit_absmax']:.1f}")
+            if "gradnorm" in m:
+                s += (f" gnorm={m['gradnorm']:.2f} "
+                      f"clip={100 * m['gradclip_frac']:.0f}%")
+            return s + "\n"
+
         out_msg = f"Epoch {epoch:3d}/{epochs} ({elapsed:.0f}s) lr={lr_now:.2e}\n"
-        out_msg += (f"  TRAIN loss={train_m['loss']:.4f} acc={train_m['acc']:.4f} b_acc={train_m['balanced_acc']:.4f} "
-                    f"f1={train_m['f1']:.4f} auc={train_m['auc']:.4f} "
-                    f"P={train_m['precision']:.4f} R={train_m['recall']:.4f}\n")
+        out_msg += _fmt("TRAIN", train_m)
         if val_m is not None:
-            out_msg += (f"  {_vlab} loss={val_m['loss']:.4f} acc={val_m['acc']:.4f} b_acc={val_m['balanced_acc']:.4f} "
-                        f"f1={val_m['f1']:.4f} auc={val_m['auc']:.4f} "
-                        f"P={val_m['precision']:.4f} R={val_m['recall']:.4f}\n")
+            out_msg += _fmt(_vlab, val_m)
         if test_m is not None:
-            out_msg += (f"  TEST  loss={test_m['loss']:.4f} acc={test_m['acc']:.4f} b_acc={test_m['balanced_acc']:.4f} "
-                        f"f1={test_m['f1']:.4f} auc={test_m['auc']:.4f} "
-                        f"P={test_m['precision']:.4f} R={test_m['recall']:.4f}\n")
+            out_msg += _fmt("TEST ", test_m)
         print(out_msg.rstrip())
 
         row = {"epoch": epoch, **{f"train_{k}": v for k, v in train_m.items()}}
@@ -689,6 +748,8 @@ def main():
         print(f"\n[{split.upper()}] "
               f"acc={m['acc']:.4f} b_acc={m['balanced_acc']:.4f} f1={m['f1']:.4f} auc={m['auc']:.4f} "
               f"P={m['precision']:.4f} R={m['recall']:.4f}")
+        print(f"          plain_loss={m['loss_plain']:.4f} ece={m['ece']:.4f} "
+              f"mlm={m['mlm']:.2f} |logit|={m['logit_absmean']:.2f}")
 
     with open(out_dir / "test_results.json", "w") as f:
         json.dump(final_metrics, f, indent=2)

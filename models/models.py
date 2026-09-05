@@ -42,8 +42,10 @@ class BaselineGRU(nn.Module):
         use_pdm:        bool  = False,
         use_polar:      bool  = False,
         use_ego_speed:  bool  = False,
+        num_outputs:    int   = 2,   # 2 = CrossEntropy/MCEL, 1 = BCE
     ):
         super().__init__()
+        self.num_outputs = num_outputs
         self.use_bbox = use_bbox
         self.use_pdm = use_pdm
         self.use_polar = use_polar
@@ -66,7 +68,7 @@ class BaselineGRU(nn.Module):
         )
 
 
-        self.decoder = nn.Linear(hidden_dim, 2)
+        self.decoder = nn.Linear(hidden_dim, num_outputs)
         
 
     def forward(
@@ -733,6 +735,7 @@ class TransformerModalityNet(nn.Module):
         head_layers:    int   = 1,            # 1 = Linear singolo, >1 = MLP
         head_hidden:    int   = None,         # dim nascosta MLP (default: hidden_dim)
         head_dropout:   float = 0.1,
+        num_outputs:    int   = 1,            # 1 = BCE, 2 = CrossEntropy/MCEL
         max_len:        int   = 512,
         obs_len:        int   = 16,           # serve solo a pooling="flatten"
         separate_encoder_speed_kinematics: bool = False,
@@ -937,10 +940,14 @@ class TransformerModalityNet(nn.Module):
         # 5b. Attention pooling (solo se pooling="attention")
         self.attn_pool = AttentionPooling(hidden_dim) if pooling == "attention" else None
 
-        # 6. Classification Head (1 logit per BCEWithLogitsLoss)
+        # 6. Classification Head
+        #    num_outputs=1 -> BCEWithLogitsLoss (comportamento originale)
+        #    num_outputs=2 -> CrossEntropyLoss / MCEL (Eq. 10 del paper)
+        self.num_outputs = num_outputs
         head_in = obs_len * hidden_dim if pooling == "flatten" else hidden_dim
         self.decoder = _build_head(
-            head_in, 1, head_layers, head_hidden or hidden_dim, head_dropout)
+            head_in, num_outputs, head_layers, head_hidden or hidden_dim,
+            head_dropout)
 
     def _modality_names(self):
         """(lista nomi modalita' attive, insieme dei nomi cinematici)."""
